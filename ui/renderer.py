@@ -15,6 +15,7 @@ from .buttons import UIButtonManager
 _UI_DIR = os.path.dirname(os.path.abspath(__file__))
 _FONT_PATH = os.path.join(_UI_DIR, "DungGeunMo.ttf")
 _FACE_GIF_PATH = os.path.join(_UI_DIR, "face.gif")
+_CURSOR_PATH = os.path.join(_UI_DIR, "cursor.png")
 
 
 class UIRenderer:
@@ -39,6 +40,9 @@ class UIRenderer:
         )
 
         self.ui_bgr, self.ui_alpha = self._load_ui_image(ui_image_path)
+
+        # 마우스 커서 스케일 추가 50% 축소 (35% 스케일, 약 22x22px 실물 커서 크기)
+        self.cursor_bgr, self.cursor_alpha, self.cursor_hotspot = self._load_cursor_image(_CURSOR_PATH, scale=0.35)
 
         # face.gif 로드 (중앙 x:1024, y:672)
         self.face_frames, self.face_durations, self.face_total_duration, self.face_bbox = self._load_face_gif(
@@ -161,6 +165,33 @@ class UIRenderer:
         bgr[620:720, 0:self.window_w] = (20, 20, 25)
 
         return bgr, alpha
+
+    def _load_cursor_image(self, path: str, scale: float = 0.35) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Tuple[int, int]]:
+        """마우스 커서 이미지(cursor.png) 35% 스케일(약 22x22px) 사전 로드 및 알파/핫스팟 계산"""
+        if not os.path.exists(path):
+            return None, None, (0, 0)
+        try:
+            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                return None, None, (0, 0)
+
+            orig_h, orig_w = img.shape[:2]
+            new_w = max(1, int(round(orig_w * scale)))
+            new_h = max(1, int(round(orig_h * scale)))
+            resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+
+            if resized.shape[2] == 4:
+                bgr = resized[:, :, :3]
+                alpha = (resized[:, :, 3].astype(np.float32) / 255.0)[:, :, np.newaxis]
+            else:
+                bgr = resized
+                alpha = np.ones((new_h, new_w, 1), dtype=np.float32)
+
+            hotspot_x = int(round(7 * scale))
+            hotspot_y = int(round(1 * scale))
+            return bgr, alpha, (hotspot_x, hotspot_y)
+        except Exception:
+            return None, None, (0, 0)
 
     def render_frame(
         self,
@@ -453,8 +484,34 @@ class UIRenderer:
             line_spacing=1
         )
 
-        # 11. 마우스 좌표 십자선
+        # 11. 마우스 커서 렌더링 (70% 스케일, 고속 넘파이 블렌딩)
         mx, my = mouse_pos
-        cv2.drawMarker(canvas, (mx, my), (0, 255, 255), cv2.MARKER_CROSS, 12, 1)
+        if self.cursor_bgr is not None and (0 <= mx < self.window_w and 0 <= my < self.window_h):
+            hx, hy = self.cursor_hotspot
+            cx1 = mx - hx
+            cy1 = my - hy
+            ch, cw = self.cursor_bgr.shape[:2]
+            cx2 = cx1 + cw
+            cy2 = cy1 + ch
+
+            x1_clip = max(0, cx1)
+            y1_clip = max(0, cy1)
+            x2_clip = min(self.window_w, cx2)
+            y2_clip = min(self.window_h, cy2)
+
+            if x1_clip < x2_clip and y1_clip < y2_clip:
+                src_x1 = x1_clip - cx1
+                src_y1 = y1_clip - cy1
+                src_x2 = src_x1 + (x2_clip - x1_clip)
+                src_y2 = src_y1 + (y2_clip - y1_clip)
+
+                c_bgr = self.cursor_bgr[src_y1:src_y2, src_x1:src_x2]
+                c_alpha = self.cursor_alpha[src_y1:src_y2, src_x1:src_x2]
+                sub_canvas = canvas[y1_clip:y2_clip, x1_clip:x2_clip]
+                canvas[y1_clip:y2_clip, x1_clip:x2_clip] = (
+                    c_bgr * c_alpha + sub_canvas * (1.0 - c_alpha)
+                ).astype(np.uint8)
+        else:
+            cv2.drawMarker(canvas, (mx, my), (0, 255, 255), cv2.MARKER_CROSS, 12, 1)
 
         return canvas

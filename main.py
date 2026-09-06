@@ -19,6 +19,45 @@ from ui.renderer import UIRenderer
 from vision.aruco_tracker import AdvancedArucoTracker
 from vision.map_transformer import MapTransformer
 
+import atexit
+import ctypes
+import ctypes.util
+
+# macOS 시스템 기본 커서 제어 (부하 없는 단일 상태 토글)
+_cg_lib = None
+try:
+    if sys.platform == "darwin":
+        _p = ctypes.util.find_library("ApplicationServices")
+        if _p:
+            _cg_lib = ctypes.cdll.LoadLibrary(_p)
+except Exception:
+    pass
+
+_system_cursor_hidden = False
+
+
+def hide_system_cursor():
+    global _system_cursor_hidden
+    if _cg_lib and not _system_cursor_hidden:
+        try:
+            _cg_lib.CGDisplayHideCursor(0)
+            _system_cursor_hidden = True
+        except Exception:
+            pass
+
+
+def show_system_cursor():
+    global _system_cursor_hidden
+    if _cg_lib and _system_cursor_hidden:
+        try:
+            _cg_lib.CGDisplayShowCursor(0)
+            _system_cursor_hidden = False
+        except Exception:
+            pass
+
+
+atexit.register(show_system_cursor)
+
 
 def load_hsv_settings(filepath: str, default_blue_hsv, default_green_hsv, default_blue_radius_x, default_blue_radius_y):
     """hsv_settings.txt 파일에서 HSV 및 좌우/상하 반경 설정값을 불러옵니다."""
@@ -240,6 +279,12 @@ class StarcraftRCApp:
 
     def _on_mouse_event(self, event, x, y, flags, param):
         self.mouse_x, self.mouse_y = x, y
+
+        # 창 내부에 마우스가 위치하면 OS 기본 화살표 커서를 숨겨 이중 커서 방지 (단일 상태 토글)
+        if 0 <= x < config.WINDOW_WIDTH and 0 <= y < config.WINDOW_HEIGHT:
+            hide_system_cursor()
+        else:
+            show_system_cursor()
 
         # 좌클릭 누름 (UI 버튼 및 옵션창 체크 - 단일 클릭만 처리하여 중복 토글 방지)
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -518,8 +563,16 @@ class StarcraftRCApp:
         self.cleanup()
 
     def cleanup(self):
+        # 시스템 커서 복원
+        show_system_cursor()
         # 최종 HSV 및 반경 설정 저장
-        save_hsv_settings(self.hsv_settings_file, self.blue_hsv, self.green_hsv, self.blue_obstacle_radius)
+        save_hsv_settings(
+            self.hsv_settings_file,
+            self.blue_hsv,
+            self.green_hsv,
+            self.blue_obstacle_radius_x,
+            self.blue_obstacle_radius_y
+        )
         self.motor.stop()
         self.motor.close()
         self.pi_cam.stop()
