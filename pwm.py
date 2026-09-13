@@ -2,6 +2,7 @@ import socket
 import json
 import time
 import threading
+import argparse
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 
@@ -73,11 +74,12 @@ class StreamingHandler(BaseHTTPRequestHandler):
 
 class PiCameraStreamer:
     """라즈베리 파이 5 카메라(Picamera2 / CSI / USB) 영상 HTTP MJPEG 스트리밍 송출"""
-    def __init__(self, camera_index: int = 0, http_port: int = 8081, width: int = 320, height: int = 240):
+    def __init__(self, camera_index: int = 0, http_port: int = 8081, width: int = 640, height: int = 480, quality: int = 80):
         self.camera_index = camera_index
         self.http_port = http_port
         self.width = width
         self.height = height
+        self.quality = max(10, min(100, quality))
         self.running = False
         self.latest_jpeg = None
         self.lock = threading.Lock()
@@ -97,7 +99,7 @@ class PiCameraStreamer:
             img[:] = (20, 20, 28)
             cv2.putText(img, "RC-CAM INITIALIZING...", (20, self.height // 2),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 230, 25), 1, cv2.LINE_AA)
-            _, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 65])
+            _, enc = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), self.quality])
             self.latest_jpeg = enc.tobytes()
 
     def _init_camera(self):
@@ -145,7 +147,7 @@ class PiCameraStreamer:
 
     def _capture_loop(self):
         cam_type = self._init_camera()
-        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 65]
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), self.quality]
 
         while self.running:
             if cam_type == "picam2" and self.picam2 is not None:
@@ -305,8 +307,23 @@ def set_motors_raw(v_left: float, v_right: float):
 
 
 def main():
-    # 1. 라즈베리 파이 1번 포트 카메라 스트리머 시작 (포트 8081)
-    camera_streamer = PiCameraStreamer(camera_index=1, http_port=8081, width=320, height=240)
+    parser = argparse.ArgumentParser(description="라즈베리 파이 RC카 모터 & 온보드 카메라 서버")
+    parser.add_argument("--width", type=int, default=640, help="카메라 가로 해상도 (기본: 640, 고화질 720p: 1280)")
+    parser.add_argument("--height", type=int, default=480, help="카메라 세로 해상도 (기본: 480, 고화질 720p: 720)")
+    parser.add_argument("--quality", type=int, default=80, help="JPEG 압축 화질 1~100 (기본: 80)")
+    parser.add_argument("--cam-index", type=int, default=1, help="카메라 장치 인덱스 (기본: 1)")
+    parser.add_argument("--cam-port", type=int, default=8081, help="카메라 HTTP 스트리밍 포트 (기본: 8081)")
+    args = parser.parse_args()
+
+    # 1. 라즈베리 파이 카메라 스트리머 시작 (기본: 640x480 @ 80% 화질)
+    print(f"[카메라 설정] 해상도: {args.width}x{args.height}, 화질: {args.quality}%, 포트: {args.cam_port}")
+    camera_streamer = PiCameraStreamer(
+        camera_index=args.cam_index,
+        http_port=args.cam_port,
+        width=args.width,
+        height=args.height,
+        quality=args.quality
+    )
     camera_streamer.start()
 
     # 2. 모터 제어 UDP 서버 시작 (포트 8080)

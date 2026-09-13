@@ -214,7 +214,8 @@ class UIRenderer:
         is_blind: bool = False,
         ip_address: str = "192.168.0.2",
         cone_base_points: Optional[List[Tuple[int, int]]] = None,
-        pi_cam_frame: Optional[np.ndarray] = None
+        pi_cam_frame: Optional[np.ndarray] = None,
+        show_lost_warning: bool = False
     ) -> np.ndarray:
         CAM_W, CAM_H = 1090, 614
 
@@ -225,19 +226,15 @@ class UIRenderer:
         cam_frame = cv2.resize(main_view, (CAM_W, CAM_H))
         canvas[0:CAM_H, 0:CAM_W] = cam_frame
 
-        # 2. 장애물 마스크 오버레이 및 선명한 테두리선(Outline)
+        # 2. 장애물 마스크 오버레이 및 선명한 테두리선(Outline) - 최적화 적용
         if blue_mask is not None and np.count_nonzero(blue_mask) > 0:
             blue_mask_cam = cv2.resize(blue_mask, (CAM_W, CAM_H), interpolation=cv2.INTER_NEAREST)
-            cam_region = canvas[0:CAM_H, 0:CAM_W].copy()
-            cam_region[blue_mask_cam > 0] = (255, 60, 60)
-            canvas[0:CAM_H, 0:CAM_W] = cv2.addWeighted(
-                canvas[0:CAM_H, 0:CAM_W], 0.7, cam_region, 0.3, 0
-            )
-
-            # 파란색 장애물 영역 외곽 테두리선 추출 및 렌더링 (주황/빨강 2px + 외곽 강조)
+            # copy 연산 제거하고 직접 색상 덮어쓰기 후 테두리만 그려서 속도 향상 (addWeighted 최소화)
+            canvas[0:CAM_H, 0:CAM_W][blue_mask_cam > 0] = (255, 60, 60)
+            
+            # 단일 테두리선으로 간소화
             obs_contours, _ = cv2.findContours(blue_mask_cam, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(canvas[0:CAM_H, 0:CAM_W], obs_contours, -1, (0, 70, 255), 2, cv2.LINE_AA)
-            cv2.drawContours(canvas[0:CAM_H, 0:CAM_W], obs_contours, -1, (200, 230, 255), 1, cv2.LINE_AA)
+            cv2.drawContours(canvas[0:CAM_H, 0:CAM_W], obs_contours, -1, (0, 70, 255), 1, cv2.LINE_AA)
 
         def sc(pt):
             return (int(pt[0] * CAM_W / self.window_w), int(pt[1] * CAM_H / self.window_h))
@@ -484,34 +481,99 @@ class UIRenderer:
             line_spacing=1
         )
 
-        # 11. 마우스 커서 렌더링 (70% 스케일, 고속 넘파이 블렌딩)
-        mx, my = mouse_pos
-        if self.cursor_bgr is not None and (0 <= mx < self.window_w and 0 <= my < self.window_h):
-            hx, hy = self.cursor_hotspot
-            cx1 = mx - hx
-            cy1 = my - hy
-            ch, cw = self.cursor_bgr.shape[:2]
-            cx2 = cx1 + cw
-            cy2 = cy1 + ch
+        # 상단 좌측 수동 모드 토글 버튼
+        cv2.rectangle(canvas, (10, 10), (180, 50), (40, 40, 180), -1)
+        cv2.rectangle(canvas, (10, 10), (180, 50), (100, 100, 255), 2)
+        cv2.putText(canvas, "MANUAL (P)", (25, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
-            x1_clip = max(0, cx1)
-            y1_clip = max(0, cy1)
-            x2_clip = min(self.window_w, cx2)
-            y2_clip = min(self.window_h, cy2)
+        # 5초 미감지 경고 표시
+        if show_lost_warning:
+            warning_text = "ArUco Lost! Click MANUAL"
+            tw, th = cv2.getTextSize(warning_text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)[0]
+            cx, cy = self.window_w // 2, self.window_h // 2
+            cv2.rectangle(canvas, (cx - tw//2 - 20, cy - th//2 - 20), (cx + tw//2 + 20, cy + th//2 + 20), (0, 0, 0), -1)
+            cv2.rectangle(canvas, (cx - tw//2 - 20, cy - th//2 - 20), (cx + tw//2 + 20, cy + th//2 + 20), (0, 0, 255), 3)
+            cv2.putText(canvas, warning_text, (cx - tw//2, cy + th//2), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 100, 255), 3, cv2.LINE_AA)
 
-            if x1_clip < x2_clip and y1_clip < y2_clip:
-                src_x1 = x1_clip - cx1
-                src_y1 = y1_clip - cy1
-                src_x2 = src_x1 + (x2_clip - x1_clip)
-                src_y2 = src_y1 + (y2_clip - y1_clip)
+        # 11. 마우스 커서 렌더링 생략 (OS 기본 커서 사용)
 
-                c_bgr = self.cursor_bgr[src_y1:src_y2, src_x1:src_x2]
-                c_alpha = self.cursor_alpha[src_y1:src_y2, src_x1:src_x2]
-                sub_canvas = canvas[y1_clip:y2_clip, x1_clip:x2_clip]
-                canvas[y1_clip:y2_clip, x1_clip:x2_clip] = (
-                    c_bgr * c_alpha + sub_canvas * (1.0 - c_alpha)
-                ).astype(np.uint8)
+        return canvas
+
+    def render_manual_frame(
+        self,
+        pi_frame: Optional[np.ndarray],
+        ip_address: str,
+        port: int,
+        speed_info: Tuple[int, int]
+    ) -> np.ndarray:
+        """수동 모드용: 라즈베리파이 카메라 전체화면 + HUD 오버레이 렌더링"""
+        W, H = self.window_w, self.window_h
+        
+        if pi_frame is not None and pi_frame.size > 0:
+            fh, fw = pi_frame.shape[:2]
+            res_info = f"{fw}x{fh}"
+            if (fw, fh) == (W, H):
+                canvas = pi_frame.copy()
+            else:
+                canvas = cv2.resize(pi_frame, (W, H), interpolation=cv2.INTER_CUBIC)
         else:
-            cv2.drawMarker(canvas, (mx, my), (0, 255, 255), cv2.MARKER_CROSS, 12, 1)
+            res_info = "--"
+            canvas = np.zeros((H, W, 3), dtype=np.uint8)
+            canvas[:] = (18, 18, 24)
+            for gy in range(0, H, 30):
+                cv2.line(canvas, (0, gy), (W, gy), (30, 30, 40), 1)
+            for gx in range(0, W, 30):
+                cv2.line(canvas, (gx, 0), (gx, H), (30, 30, 40), 1)
+            cv2.putText(canvas, "RC-CAM: NO SIGNAL / CONNECTING...",
+                        (W // 2 - 220, H // 2 - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 180, 255), 2, cv2.LINE_AA)
+            cv2.putText(canvas,
+                        f"PI CAM  {ip_address}:{port}",
+                        (W // 2 - 200, H // 2 + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 120, 200), 1, cv2.LINE_AA)
+
+        vl, vr = speed_info
+        direction_label = "STOP"
+        if vl > 0 and vr > 0: direction_label = "FORWARD"
+        elif vl < 0 and vr < 0: direction_label = "BACKWARD"
+        elif vl < 0 and vr > 0: direction_label = "LEFT"
+        elif vl > 0 and vr < 0: direction_label = "RIGHT"
+
+        # HUD 오버레이
+        overlay = canvas.copy()
+        cv2.rectangle(overlay, (0, 0), (W, 56), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.6, canvas, 0.4, 0, canvas)
+
+        # 상단 좌측 자동 모드 토글 버튼
+        cv2.rectangle(canvas, (10, 10), (180, 50), (180, 40, 40), -1)
+        cv2.rectangle(canvas, (10, 10), (180, 50), (255, 100, 100), 2)
+        cv2.putText(canvas, "AUTO (P)", (45, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+
+        cv2.putText(canvas, "W:Forward  S:Back  A:Left  D:Right  |  P: Auto Mode",
+                    (220, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
+
+        dir_colors = {
+            "FORWARD":  (0, 255, 100),
+            "BACKWARD": (0, 120, 255),
+            "LEFT":     (255, 200, 0),
+            "RIGHT":    (255, 200, 0),
+            "STOP":     (100, 100, 100),
+        }
+        dir_color = dir_colors.get(direction_label, (200, 200, 200))
+        cv2.putText(canvas, direction_label,
+                    (16, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.6, dir_color, 2, cv2.LINE_AA)
+
+        cv2.putText(canvas, f"L:{vl:+4d}  R:{vr:+4d}",
+                    (W - 200, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 230, 25), 1, cv2.LINE_AA)
+
+        overlay2 = canvas.copy()
+        cv2.rectangle(overlay2, (0, H - 36), (W, H), (0, 0, 0), -1)
+        cv2.addWeighted(overlay2, 0.55, canvas, 0.45, 0, canvas)
+        cv2.putText(canvas,
+                    f"RC-CAM LIVE [{res_info}]  |  PI: {ip_address}:{port}  |  ESC: Quit",
+                    (16, H - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1, cv2.LINE_AA)
+
+        live_color = (0, 255, 0) if (pi_frame is not None) else (0, 0, 200)
+        cv2.circle(canvas, (W - 20, H - 18), 7, live_color, -1, cv2.LINE_AA)
 
         return canvas

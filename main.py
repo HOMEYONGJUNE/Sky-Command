@@ -2,6 +2,7 @@ import math
 import sys
 import os
 import time
+import threading
 import cv2
 import numpy as np
 from typing import List, Optional, Tuple
@@ -19,44 +20,11 @@ from ui.renderer import UIRenderer
 from vision.aruco_tracker import AdvancedArucoTracker
 from vision.map_transformer import MapTransformer
 
-import atexit
-import ctypes
-import ctypes.util
+from pynput import keyboard as pynput_keyboard
 
-# macOS 시스템 기본 커서 제어 (부하 없는 단일 상태 토글)
-_cg_lib = None
-try:
-    if sys.platform == "darwin":
-        _p = ctypes.util.find_library("ApplicationServices")
-        if _p:
-            _cg_lib = ctypes.cdll.LoadLibrary(_p)
-except Exception:
-    pass
-
-_system_cursor_hidden = False
+MANUAL_PWM = 100 # 수동 모드 모터 속도 (0~255)
 
 
-def hide_system_cursor():
-    global _system_cursor_hidden
-    if _cg_lib and not _system_cursor_hidden:
-        try:
-            _cg_lib.CGDisplayHideCursor(0)
-            _system_cursor_hidden = True
-        except Exception:
-            pass
-
-
-def show_system_cursor():
-    global _system_cursor_hidden
-    if _cg_lib and _system_cursor_hidden:
-        try:
-            _cg_lib.CGDisplayShowCursor(0)
-            _system_cursor_hidden = False
-        except Exception:
-            pass
-
-
-atexit.register(show_system_cursor)
 
 
 def load_hsv_settings(filepath: str, default_blue_hsv, default_green_hsv, default_blue_radius_x, default_blue_radius_y):
@@ -232,6 +200,31 @@ class StarcraftRCApp:
         self.latest_green_mask = None
         self.latest_total_obstacle = None
         self.latest_cone_base_points = []
+        
+        # --- 수동 조작 모드 및 페이드 효과 상태 변수 ---
+        self.manual_mode = False
+        self.manual_vl = 0.0
+        self.manual_vr = 0.0
+        self.last_manual_key_time = 0.0
+        self.last_aruco_seen_time = time.time()
+        self.aruco_popup_shown = False
+        self.aruco_popup_result = None
+        
+        self.fade_progress = 0.0
+        self.fade_start_time = 0.0
+        self.is_fading = False
+        self.fade_target = False # True = manual, False = auto
+
+        # --- pynput OS 레벨 키 상태 추적 ---
+        # cv2.waitKey는 OpenCV 윈도우에 포커스가 없으면 입력이 막혀 WASD가 작동 안 함
+        # pynput으로 OS 레벨에서 현재 눌린 키 집합을 추적
+        self._pressed_keys: set = set()
+        self._key_listener = pynput_keyboard.Listener(
+            on_press=self._on_key_press,
+            on_release=self._on_key_release
+        )
+        self._key_listener.daemon = True
+        self._key_listener.start()
 
         # 윈도우 생성 및 마우스 콜백 등록
         cv2.namedWindow(config.WINDOW_TITLE, cv2.WINDOW_NORMAL)
@@ -277,17 +270,34 @@ class StarcraftRCApp:
         except Exception as e:
             print(f"[카메라 포커스 오류]: {e}")
 
+    def _on_key_press(self, key):
+        """pynput: OS 레벨 키 누름 이벤트 - 눌린 키를 집합에 추가"""
+        try:
+            ch = key.char.lower() if hasattr(key, 'char') and key.char else None
+            if ch:
+                self._pressed_keys.add(ch)
+        except Exception:
+            pass
+
+    def _on_key_release(self, key):
+        """pynput: OS 레벨 키 뗌 이벤트 - 눌린 키를 집합에서 제거"""
+        try:
+            ch = key.char.lower() if hasattr(key, 'char') and key.char else None
+            if ch:
+                self._pressed_keys.discard(ch)
+        except Exception:
+            pass
+
     def _on_mouse_event(self, event, x, y, flags, param):
         self.mouse_x, self.mouse_y = x, y
 
-        # 창 내부에 마우스가 위치하면 OS 기본 화살표 커서를 숨겨 이중 커서 방지 (단일 상태 토글)
-        if 0 <= x < config.WINDOW_WIDTH and 0 <= y < config.WINDOW_HEIGHT:
-            hide_system_cursor()
-        else:
-            show_system_cursor()
-
         # 좌클릭 누름 (UI 버튼 및 옵션창 체크 - 단일 클릭만 처리하여 중복 토글 방지)
         if event == cv2.EVENT_LBUTTONDOWN:
+            # 수동 모드 토글 버튼 (Top-Left 10,10 ~ 180,50)
+            if 10 <= x <= 180 and 10 <= y <= 50:
+                self._toggle_manual_mode()
+                return
+
             # 옵션창 버튼 클릭 영역 (x: 981~1058, y: 609~630)
             if 981 <= x <= 1058 and 609 <= y <= 630:
                 now = time.time()
@@ -415,9 +425,78 @@ class StarcraftRCApp:
         except Exception:
             pass
 
+    # ──────────────────────────────────────────────────────────────────
+    # 수동 조작 모드 진입/종료 (페이드 애니메이션 포함)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _enter_manual_mode(self):
+        """수동 조작 모드로 전환 (페이드 시작)."""
+        if not self.manual_mode:
+            self.manual_mode = True
+            self.motor.stop()
+            self.nav.reset()
+            self.is_fading = True
+            self.fade_start_time = time.time()
+            self.fade_target = True  # 목표: 수동 화면
+            print("[수동 모드] 수동 조작 모드로 전환 중... (P: 자동 모드 복귀 | W/A/S/D: 조작)")
+
+    def _exit_manual_mode(self):
+        """자동 조작 모드로 복귀 (페이드 시작)."""
+        if self.manual_mode:
+            self.manual_mode = False
+            self.motor.stop()
+            self.last_aruco_seen_time = time.time()
+            self.aruco_popup_shown = False
+            self.is_fading = True
+            self.fade_start_time = time.time()
+            self.fade_target = False  # 목표: 자동(탑뷰) 화면
+            print("[자동 모드] 자동 조작 모드로 복귀 중...")
+
+    def _toggle_manual_mode(self):
+        """P키: 수동/자동 토글"""
+        # 페이드 진행 중에는 토글 무시 (안정성)
+        if self.is_fading:
+            return
+        if self.manual_mode:
+            self._exit_manual_mode()
+        else:
+            self._enter_manual_mode()
+
+    def _update_fade(self):
+        """페이드 진행률 업데이트 (0.5초 기준)"""
+        if self.is_fading:
+            elapsed = time.time() - self.fade_start_time
+            fade_duration = 0.5  # 0.5초 동안 전환
+            if elapsed >= fade_duration:
+                self.is_fading = False
+                self.fade_progress = 1.0 if self.fade_target else 0.0
+            else:
+                ratio = elapsed / fade_duration
+                # target=True(수동)이면 0->1, target=False(자동)이면 1->0
+                self.fade_progress = ratio if self.fade_target else (1.0 - ratio)
+
+    # ──────────────────────────────────────────────────────────────────
+    # ArUco 7초 미검출 팝업 (별도 스레드에서 tkinter 실행)
+    # ──────────────────────────────────────────────────────────────────
+
+    # ──────────────────────────────────────────────────────────────────
+    # 메인 루프
+    # ──────────────────────────────────────────────────────────────────
+
     def run(self):
         while self.is_running:
-            # 1. 프레임 읽기 (메인 관제 카메라는 원본 그대로 유지)
+            # ── 키보드 입력 처리 ──────────────────────────────────
+            key = cv2.waitKey(1) & 0xFF
+            if key == 27: # ESC
+                break
+            if key in [ord('p'), ord('P')]:
+                self._toggle_manual_mode()
+
+            # ── 상태 업데이트 ──────────────────────────────────────
+            self._update_fade()
+
+            # ── 영상 데이터 준비 ───────────────────────────────────
+            # 메인 관제 카메라 프레임
             if self.has_camera:
                 ret, frame = self.cap.read()
                 if not ret or frame is None:
@@ -425,146 +504,133 @@ class StarcraftRCApp:
             else:
                 frame = np.zeros((config.WINDOW_HEIGHT, config.WINDOW_WIDTH, 3), dtype=np.uint8)
 
-            self._update_hsv_from_trackbars()
-
-            # 2. 해상도 맞춤
             if frame.shape[0] != config.WINDOW_HEIGHT or frame.shape[1] != config.WINDOW_WIDTH:
                 warped_map = cv2.resize(frame, (config.WINDOW_WIDTH, config.WINDOW_HEIGHT))
             else:
                 warped_map = frame.copy()
 
-            # 3. 마스크 추출 (좌우/상하 팽창 반경 실시간 적용)
-            hsv_map = cv2.cvtColor(warped_map, cv2.COLOR_BGR2HSV)
-            blue_mask, cone_base_points = self.map_trans.extract_blue_obstacle_mask(
-                hsv_map,
-                h_min=self.blue_hsv[0], h_max=self.blue_hsv[1],
-                s_min=self.blue_hsv[2], v_min=self.blue_hsv[3],
-                dilate_x=self.blue_obstacle_radius_x,
-                dilate_y=self.blue_obstacle_radius_y
-            )
-            green_mask = self.map_trans.extract_green_terrain_mask(
-                hsv_map,
-                h_min=self.green_hsv[0], h_max=self.green_hsv[1],
-                s_min=self.green_hsv[2], v_min=self.green_hsv[3]
-            )
-            self.latest_blue_mask = blue_mask
-            self.latest_green_mask = green_mask
-            self.latest_cone_base_points = cone_base_points
+            # ── 자동 모드용 데이터 연산 (페이드 중이거나 자동 모드일 때) ──
+            ui_output = None
+            if not self.manual_mode or self.is_fading:
+                self._update_hsv_from_trackbars()
+                hsv_map = cv2.cvtColor(warped_map, cv2.COLOR_BGR2HSV)
+                blue_mask, cone_base_points = self.map_trans.extract_blue_obstacle_mask(
+                    hsv_map,
+                    h_min=self.blue_hsv[0], h_max=self.blue_hsv[1],
+                    s_min=self.blue_hsv[2], v_min=self.blue_hsv[3],
+                    dilate_x=self.blue_obstacle_radius_x,
+                    dilate_y=self.blue_obstacle_radius_y
+                )
+                green_mask = self.map_trans.extract_green_terrain_mask(
+                    hsv_map,
+                    h_min=self.green_hsv[0], h_max=self.green_hsv[1],
+                    s_min=self.green_hsv[2], v_min=self.green_hsv[3]
+                )
+                self.latest_blue_mask = blue_mask
+                self.latest_green_mask = green_mask
+                self.latest_cone_base_points = cone_base_points
+                self.latest_total_obstacle = self._get_total_obstacle_mask(blue_mask, green_mask, cone_base_points)
 
-            # 파란색 장애물 + 꼬깔 바닥점 + 유효 초록색 외 영역 종합 마스크
-            total_obstacle = self._get_total_obstacle_mask(blue_mask, green_mask, cone_base_points)
-            self.latest_total_obstacle = total_obstacle
+                robot_pos, robot_angle, corners, is_tracked, _ = self.tracker.detect(warped_map)
+                
+                if is_tracked and robot_pos is not None:
+                    self.last_robot_pos = robot_pos
+                    self.last_robot_angle = robot_angle
+                    self.last_aruco_seen_time = time.time()
 
-            # 4. ArUco 마커 검출
-            robot_pos, robot_angle, corners, is_tracked, _ = self.tracker.detect(warped_map)
+                    if corners is not None and len(corners) >= 4:
+                        pts = np.array(corners, dtype=np.float32)
+                        side0 = float(np.linalg.norm(pts[1] - pts[0]))
+                        side1 = float(np.linalg.norm(pts[2] - pts[1]))
+                        side2 = float(np.linalg.norm(pts[3] - pts[2]))
+                        side3 = float(np.linalg.norm(pts[0] - pts[3]))
+                        avg_side = (side0 + side1 + side2 + side3) / 4.0
+                        self.nav.planner.robot_radius_px = max(60, int(avg_side * 1.6))
 
-            if is_tracked and robot_pos is not None:
-                self.last_robot_pos = robot_pos
-                self.last_robot_angle = robot_angle
+                    if self.home_pos is None:
+                        self.home_pos = robot_pos
+                        print(f"[홈 등록] 초기 위치: {self.home_pos}")
 
-                # 마커 한 변 길이 측정 -> 1.6배 확장된 원형 차체 크기에 따른 A* 회피 반경 실시간 동기화
-                if corners is not None and len(corners) >= 4:
-                    pts = np.array(corners, dtype=np.float32)
-                    side0 = float(np.linalg.norm(pts[1] - pts[0]))
-                    side1 = float(np.linalg.norm(pts[2] - pts[1]))
-                    side2 = float(np.linalg.norm(pts[3] - pts[2]))
-                    side3 = float(np.linalg.norm(pts[0] - pts[3]))
-                    avg_side = (side0 + side1 + side2 + side3) / 4.0
-                    
-                    # 원형 차체 반경: 기존 2배 크기 대비 1.6배 더 크게 설정 (반경 = 마커 한 변 * 1.6)
-                    dynamic_car_radius = max(60, int(avg_side * 1.6))
-                    self.nav.planner.robot_radius_px = dynamic_car_radius
+                # ArUco 5초 미감지 체크 (화면 경고 플래그만 설정)
+                show_lost_warning = False
+                if not self.manual_mode and not self.is_fading:
+                    if time.time() - self.last_aruco_seen_time >= 5.0:
+                        show_lost_warning = True
 
-                # 처음 감지된 위치를 홈 위치로 등록
-                if self.home_pos is None:
-                    self.home_pos = robot_pos
-                    print(f"[홈 등록] 초기 위치: {self.home_pos}")
+                # 주행 제어 업데이트 (자동 모드일 때만 전송)
+                v_left, v_right, nav_state = self.nav.update_control(robot_pos, robot_angle)
+                if not self.manual_mode and not self.is_fading:
+                    self.motor.send_speed(v_left, v_right)
 
-            # 5. 주행 제어 및 모터 명령 전송
-            v_left, v_right, nav_state = self.nav.update_control(robot_pos, robot_angle)
-            self.motor.send_speed(v_left, v_right)
+                # 자동 모드 렌더링 준비
+                auto_canvas = self.renderer.render_frame(
+                    main_view=warped_map,
+                    log_lines=self.logger.log_lines,
+                    robot_pos=robot_pos,
+                    robot_angle_deg=robot_angle,
+                    waypoints=self.nav.waypoints,
+                    current_wp_idx=self.nav.current_wp_idx,
+                    goal_pos=self.nav.final_goal,
+                    blue_mask=blue_mask,
+                    green_mask=green_mask,
+                    ping_pos=self.nav.ping_pos,
+                    ping_start_time=self.nav.ping_start_time,
+                    mouse_pos=(self.mouse_x, self.mouse_y),
+                    status_text=nav_state.value if robot_pos is not None else "SEARCHING",
+                    speed_info=(int(v_left), int(v_right)),
+                    marker_corners=corners,
+                    home_pos=self.home_pos,
+                    is_blind=False,
+                    ip_address=config.RASPBERRY_PI_IP,
+                    cone_base_points=self.latest_cone_base_points,
+                    pi_cam_frame=self.pi_cam.get_latest_frame(),
+                    show_lost_warning=show_lost_warning
+                )
 
+            # ── 수동 모드 연산 및 제어 (페이드 중이거나 수동 모드일 때) ──
+            if self.manual_mode or self.is_fading:
+                # WASD 제어 - pynput으로 OS 레벨에서 현재 눌린 키를 실시간 확인
+                vl, vr = 0, 0
+                if self.manual_mode and not self.is_fading:
+                    keys = self._pressed_keys  # 현재 눌린 키 집합 참조
 
-            # 6. UI 프레임 합성
-            ui_output = self.renderer.render_frame(
-                main_view=warped_map,
-                log_lines=self.logger.log_lines,
-                robot_pos=robot_pos,
-                robot_angle_deg=robot_angle,
-                waypoints=self.nav.waypoints,
-                current_wp_idx=self.nav.current_wp_idx,
-                goal_pos=self.nav.final_goal,
-                blue_mask=blue_mask,
-                green_mask=green_mask,
-                ping_pos=self.nav.ping_pos,
-                ping_start_time=self.nav.ping_start_time,
-                mouse_pos=(self.mouse_x, self.mouse_y),
-                status_text=nav_state.value if robot_pos is not None else "SEARCHING",
-                speed_info=(int(v_left), int(v_right)),
-                marker_corners=corners,
-                home_pos=self.home_pos,
-                is_blind=False,
-                ip_address=config.RASPBERRY_PI_IP,
-                cone_base_points=self.latest_cone_base_points,
-                pi_cam_frame=self.pi_cam.get_latest_frame()
-            )
+                    if 'w' in keys:
+                        vl, vr = MANUAL_PWM, MANUAL_PWM    # 직진
+                    elif 's' in keys:
+                        vl, vr = -MANUAL_PWM, -MANUAL_PWM  # 후진
+                    elif 'a' in keys:
+                        vl, vr = -MANUAL_PWM, MANUAL_PWM   # 왼쪽 회전
+                    elif 'd' in keys:
+                        vl, vr = MANUAL_PWM, -MANUAL_PWM   # 오른쪽 회전
+
+                    if vl != 0 or vr != 0:
+                        self.motor.send_speed(vl, vr)
+                    else:
+                        self.motor.stop()
+
+                manual_canvas = self.renderer.render_manual_frame(
+                    pi_frame=self.pi_cam.get_latest_frame(),
+                    ip_address=config.RASPBERRY_PI_IP,
+                    port=config.RASPBERRY_PI_CAM_PORT,
+                    speed_info=(vl, vr)
+                )
+
+            # ── 화면 렌더링 선택/블렌딩 ─────────────────────────────
+            if self.is_fading:
+                ui_output = cv2.addWeighted(auto_canvas, 1.0 - self.fade_progress, manual_canvas, self.fade_progress, 0)
+            elif self.manual_mode:
+                ui_output = manual_canvas
+            else:
+                ui_output = auto_canvas
 
             cv2.imshow(config.WINDOW_TITLE, ui_output)
-
-            # 7. 키보드 입력 처리
-            key = cv2.waitKey(1) & 0xFF
-
-            # 초점 맞춤
-            if key in [ord('f'), ord('F')]:
-                self._init_camera_focus()
-
-
-            # 홈 복귀
-            elif key in [ord('b'), ord('B'), ord('q'), ord('Q')]:
-                target_home = self.home_pos if self.home_pos is not None else (640, 360)
-                if self.last_robot_pos is not None:
-                    total_obs = self._get_total_obstacle_mask(
-                        self.latest_blue_mask, self.latest_green_mask, self.latest_cone_base_points
-                    )
-                    self.nav.set_goal(self.last_robot_pos, target_home, total_obs)
-                else:
-                    print("[오류] 마커 미인식")
-
-            # HSV 트랙바 창 토글
-            elif key in [ord('h'), ord('H')]:
-                self.show_hsv_controls = not self.show_hsv_controls
-                if self.show_hsv_controls:
-                    self._setup_hsv_controls()
-                else:
-                    cv2.destroyWindow("HSV Controls")
-
-            # 긴급 정지
-            elif key in [ord('s'), ord('S')]:
-                self.motor.stop()
-                self.nav.reset()
-                print("[정지] 비상 정지")
-
-            # 홈 위치 재설정
-            elif key in [ord('r'), ord('R')]:
-                self.motor.stop()
-                self.nav.reset()
-                self.tracker.reset()
-                if self.last_robot_pos is not None:
-                    self.home_pos = self.last_robot_pos
-                    print(f"[홈 재설정] {self.home_pos}")
-
-            # ESC 종료
-            elif key == 27:
-                break
-
+            
             if cv2.getWindowProperty(config.WINDOW_TITLE, cv2.WND_PROP_VISIBLE) < 1:
                 break
-
+                
         self.cleanup()
 
     def cleanup(self):
-        # 시스템 커서 복원
-        show_system_cursor()
         # 최종 HSV 및 반경 설정 저장
         save_hsv_settings(
             self.hsv_settings_file,
@@ -576,6 +642,10 @@ class StarcraftRCApp:
         self.motor.stop()
         self.motor.close()
         self.pi_cam.stop()
+        try:
+            self._key_listener.stop()
+        except Exception:
+            pass
         if self.has_camera:
             self.cap.release()
         cv2.destroyAllWindows()

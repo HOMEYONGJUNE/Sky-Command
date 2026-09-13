@@ -63,10 +63,16 @@ class PiCamReceiver:
 
                 bytes_buffer = b""
                 while self.running:
-                    chunk = stream.read(4096)
+                    chunk = stream.read(8192)
                     if not chunk:
                         break
                     bytes_buffer += chunk
+
+                    # 버퍼가 너무 많이 쌓인 경우(지연 방지) 가장 최신 JPEG 시작 위치로 리셋
+                    if len(bytes_buffer) > 120000:
+                        last_a = bytes_buffer.rfind(b"\xff\xd8")
+                        if last_a != -1:
+                            bytes_buffer = bytes_buffer[last_a:]
 
                     # JPEG 이미지 시작(\xff\xd8) 및 종료(\xff\xd9) 탐색
                     a = bytes_buffer.find(b"\xff\xd8")
@@ -75,7 +81,6 @@ class PiCamReceiver:
                         jpg = bytes_buffer[a:b + 2]
                         bytes_buffer = bytes_buffer[b + 2:]
 
-                        # 이미지 디코딩
                         frame = cv2.imdecode(np.frombuffer(jpg, dtype=np.uint8), cv2.IMREAD_COLOR)
                         if frame is not None:
                             with self.lock:
