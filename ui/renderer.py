@@ -16,6 +16,9 @@ _UI_DIR = os.path.dirname(os.path.abspath(__file__))
 _FONT_PATH = os.path.join(_UI_DIR, "DungGeunMo.ttf")
 _FACE_GIF_PATH = os.path.join(_UI_DIR, "face.gif")
 _CURSOR_PATH = os.path.join(_UI_DIR, "cursor.png")
+_DRIVING_SWITCH_PATH = os.path.join(_UI_DIR, "driving_mode_switch_button.png")
+_SUDONG_WINDOW_PATH = os.path.join(_UI_DIR, "Sudong_window.png")
+_SUDONG_BUTTON_PATH = os.path.join(_UI_DIR, "Sudong_button.png")
 
 
 class UIRenderer:
@@ -40,6 +43,11 @@ class UIRenderer:
         )
 
         self.ui_bgr, self.ui_alpha = self._load_ui_image(ui_image_path)
+
+        # 주행 모드 전환 버튼 및 수동 안내창 이미지 로드 (1280x720 RGBA)
+        self.driving_switch_bgr, self.driving_switch_alpha, self.driving_switch_bbox = self._load_overlay_layer(_DRIVING_SWITCH_PATH)
+        self.sudong_window_bgr, self.sudong_window_alpha, self.sudong_window_bbox = self._load_overlay_layer(_SUDONG_WINDOW_PATH)
+        self.sudong_button_bgr, self.sudong_button_alpha, self.sudong_button_bbox = self._load_overlay_layer(_SUDONG_BUTTON_PATH)
 
         # 마우스 커서 스케일 추가 50% 축소 (35% 스케일, 약 22x22px 실물 커서 크기)
         self.cursor_bgr, self.cursor_alpha, self.cursor_hotspot = self._load_cursor_image(_CURSOR_PATH, scale=0.35)
@@ -192,6 +200,68 @@ class UIRenderer:
             return bgr, alpha, (hotspot_x, hotspot_y)
         except Exception:
             return None, None, (0, 0)
+
+    def _load_overlay_layer(self, path: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[Tuple[int, int, int, int]]]:
+        """1280x720 오버레이 PNG(RGBA)를 로드하고 BGR, 알파(0~1), 유효 바운딩 박스를 반환합니다."""
+        if not os.path.exists(path):
+            return None, None, None
+        try:
+            img_array = np.fromfile(path, np.uint8)
+            img = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                return None, None, None
+            if img.shape[0] != self.window_h or img.shape[1] != self.window_w:
+                img = cv2.resize(img, (self.window_w, self.window_h))
+            if img.shape[2] == 4:
+                bgr = img[:, :, :3]
+                alpha = img[:, :, 3].astype(np.float32) / 255.0
+                alpha_raw = img[:, :, 3]
+            else:
+                bgr = img
+                alpha = np.ones((self.window_h, self.window_w), dtype=np.float32)
+                alpha_raw = np.full((self.window_h, self.window_w), 255, dtype=np.uint8)
+
+            ys, xs = np.where(alpha_raw > 10)
+            if len(xs) > 0:
+                bbox = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+            else:
+                bbox = None
+            return bgr, alpha, bbox
+        except Exception as e:
+            print(f"[UI 로드 오류] {path}: {e}")
+            return None, None, None
+
+    def _blend_layer(
+        self,
+        canvas: np.ndarray,
+        bgr: Optional[np.ndarray],
+        alpha: Optional[np.ndarray],
+        bbox: Optional[Tuple[int, int, int, int]]
+    ) -> np.ndarray:
+        """바운딩 박스 영역만 고속 알파 블렌딩하여 캔버스에 합성합니다."""
+        if bgr is None or alpha is None or bbox is None:
+            return canvas
+        x1, y1, x2, y2 = bbox
+        sub_alpha = alpha[y1:y2, x1:x2, np.newaxis]
+        sub_bgr = bgr[y1:y2, x1:x2]
+        canvas[y1:y2, x1:x2] = (sub_bgr * sub_alpha + canvas[y1:y2, x1:x2] * (1.0 - sub_alpha)).astype(np.uint8)
+        return canvas
+
+    def is_driving_mode_switch_clicked(self, x: int, y: int) -> bool:
+        """좌측 상단 driving_mode_switch_button.png의 투명하지 않은 영역 클릭 여부 판정"""
+        if self.driving_switch_alpha is None:
+            return False
+        if 0 <= x < self.window_w and 0 <= y < self.window_h:
+            return bool(self.driving_switch_alpha[y, x] > 0.05)
+        return False
+
+    def is_sudong_button_clicked(self, x: int, y: int) -> bool:
+        """수동 전환 창(Sudong_button.png)의 투명하지 않은 영역 클릭 여부 판정"""
+        if self.sudong_button_alpha is None:
+            return False
+        if 0 <= x < self.window_w and 0 <= y < self.window_h:
+            return bool(self.sudong_button_alpha[y, x] > 0.05)
+        return False
 
     def render_frame(
         self,
@@ -481,21 +551,15 @@ class UIRenderer:
             line_spacing=1
         )
 
-        # 상단 좌측 수동 모드 토글 버튼
-        cv2.rectangle(canvas, (10, 10), (180, 50), (40, 40, 180), -1)
-        cv2.rectangle(canvas, (10, 10), (180, 50), (100, 100, 255), 2)
-        cv2.putText(canvas, "MANUAL (P)", (25, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-
-        # 5초 미감지 경고 표시
+        # 11. ArUco 5초 이상 미감지 시 수동 전환 창 및 버튼 오버레이 (Sudong_window.png + Sudong_button.png)
         if show_lost_warning:
-            warning_text = "ArUco Lost! Click MANUAL"
-            tw, th = cv2.getTextSize(warning_text, cv2.FONT_HERSHEY_SIMPLEX, 1.2, 3)[0]
-            cx, cy = self.window_w // 2, self.window_h // 2
-            cv2.rectangle(canvas, (cx - tw//2 - 20, cy - th//2 - 20), (cx + tw//2 + 20, cy + th//2 + 20), (0, 0, 0), -1)
-            cv2.rectangle(canvas, (cx - tw//2 - 20, cy - th//2 - 20), (cx + tw//2 + 20, cy + th//2 + 20), (0, 0, 255), 3)
-            cv2.putText(canvas, warning_text, (cx - tw//2, cy + th//2), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 100, 255), 3, cv2.LINE_AA)
+            canvas = self._blend_layer(canvas, self.sudong_window_bgr, self.sudong_window_alpha, self.sudong_window_bbox)
+            canvas = self._blend_layer(canvas, self.sudong_button_bgr, self.sudong_button_alpha, self.sudong_button_bbox)
 
-        # 11. 마우스 커서 렌더링 생략 (OS 기본 커서 사용)
+        # 12. 좌측 상단 주행 모드 전환 버튼 오버레이 (driving_mode_switch_button.png, 관제 화면 최상위 레이어)
+        canvas = self._blend_layer(canvas, self.driving_switch_bgr, self.driving_switch_alpha, self.driving_switch_bbox)
+
+        # 13. 마우스 커서 렌더링 생략 (OS 기본 커서 사용)
 
         return canvas
 
@@ -544,13 +608,9 @@ class UIRenderer:
         cv2.rectangle(overlay, (0, 0), (W, 56), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.6, canvas, 0.4, 0, canvas)
 
-        # 상단 좌측 자동 모드 토글 버튼
-        cv2.rectangle(canvas, (10, 10), (180, 50), (180, 40, 40), -1)
-        cv2.rectangle(canvas, (10, 10), (180, 50), (255, 100, 100), 2)
-        cv2.putText(canvas, "AUTO (P)", (45, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-
+        # 상단 HUD 텍스트 (좌측 0~200 영역은 driving_mode_switch_button이 위치하므로 x=215부터 출력)
         cv2.putText(canvas, "W:Forward  S:Back  A:Left  D:Right  |  P: Auto Mode",
-                    (220, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (220, 220, 220), 1, cv2.LINE_AA)
+                    (215, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (220, 220, 220), 1, cv2.LINE_AA)
 
         dir_colors = {
             "FORWARD":  (0, 255, 100),
@@ -560,8 +620,11 @@ class UIRenderer:
             "STOP":     (100, 100, 100),
         }
         dir_color = dir_colors.get(direction_label, (200, 200, 200))
-        cv2.putText(canvas, direction_label,
-                    (16, 52), cv2.FONT_HERSHEY_SIMPLEX, 0.6, dir_color, 2, cv2.LINE_AA)
+        cv2.putText(canvas, f"STATUS: {direction_label}",
+                    (215, 48), cv2.FONT_HERSHEY_SIMPLEX, 0.55, dir_color, 2, cv2.LINE_AA)
+
+        # 좌측 상단 주행 모드 전환 버튼 오버레이 (driving_mode_switch_button.png, 수동 화면 최상위 레이어)
+        canvas = self._blend_layer(canvas, self.driving_switch_bgr, self.driving_switch_alpha, self.driving_switch_bbox)
 
         cv2.putText(canvas, f"L:{vl:+4d}  R:{vr:+4d}",
                     (W - 200, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 230, 25), 1, cv2.LINE_AA)

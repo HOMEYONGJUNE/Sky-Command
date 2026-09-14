@@ -207,6 +207,7 @@ class StarcraftRCApp:
         self.manual_vr = 0.0
         self.last_manual_key_time = 0.0
         self.last_aruco_seen_time = time.time()
+        self.show_lost_warning = False
         self.aruco_popup_shown = False
         self.aruco_popup_result = None
         
@@ -293,8 +294,16 @@ class StarcraftRCApp:
 
         # 좌클릭 누름 (UI 버튼 및 옵션창 체크 - 단일 클릭만 처리하여 중복 토글 방지)
         if event == cv2.EVENT_LBUTTONDOWN:
-            # 수동 모드 토글 버튼 (Top-Left 10,10 ~ 180,50)
-            if 10 <= x <= 180 and 10 <= y <= 50:
+            # 1. ArUco 5초 미감지 수동 전환 창의 버튼 클릭 체크 (Sudong_button.png 투명 제외 영역)
+            if getattr(self, "show_lost_warning", False) and self.renderer.is_sudong_button_clicked(x, y):
+                print("[UI] Sudong_button 클릭 감지 -> 수동 조작 모드로 전환합니다.")
+                self.show_lost_warning = False
+                self._enter_manual_mode()
+                return
+
+            # 2. 좌측 상단 주행 모드 전환 버튼 클릭 체크 (driving_mode_switch_button.png 투명 제외 영역)
+            if self.renderer.is_driving_mode_switch_clicked(x, y):
+                print("[UI] driving_mode_switch_button 클릭 감지 -> 주행 모드 전환")
                 self._toggle_manual_mode()
                 return
 
@@ -551,11 +560,12 @@ class StarcraftRCApp:
                         self.home_pos = robot_pos
                         print(f"[홈 등록] 초기 위치: {self.home_pos}")
 
-                # ArUco 5초 미감지 체크 (화면 경고 플래그만 설정)
+                # ArUco 5초 미감지 체크 (화면 안내창 플래그 설정)
                 show_lost_warning = False
                 if not self.manual_mode and not self.is_fading:
                     if time.time() - self.last_aruco_seen_time >= 5.0:
                         show_lost_warning = True
+                self.show_lost_warning = show_lost_warning
 
                 # 주행 제어 업데이트 (자동 모드일 때만 전송)
                 v_left, v_right, nav_state = self.nav.update_control(robot_pos, robot_angle)
