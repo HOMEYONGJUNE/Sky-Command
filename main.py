@@ -19,10 +19,15 @@ from ui.logger import TerminalLogger
 from ui.renderer import UIRenderer
 from vision.aruco_tracker import AdvancedArucoTracker
 from vision.map_transformer import MapTransformer
+from vision.yolo_obstacle_detector import YOLOObstacleDetector
+from vision.yolo_obstacle_detector import Detection
 
 from pynput import keyboard as pynput_keyboard
 
 MANUAL_PWM = 100 # 수동 모드 모터 속도 (0~255)
+OBSTACLE_MODEL_PATH = os.path.join(CURRENT_DIR, "best.pt")
+ULTRASONIC_MAX_RANGE_CM = 50.0
+ULTRASONIC_PIXELS_PER_METER = 900.0
 
 
 
@@ -110,19 +115,33 @@ class StarcraftRCApp:
 
         # 제어 및 비전 모듈 초기화
         self.motor = MotorClient(ip=config.RASPBERRY_PI_IP, port=config.UDP_PORT)
+        self.motor.start_telemetry_listener()
         self.pi_cam = PiCamReceiver(ip=config.RASPBERRY_PI_IP, port=config.RASPBERRY_PI_CAM_PORT)
         self.pi_cam.start()
         self.tracker = AdvancedArucoTracker(
             dictionary_id=config.ARUCO_DICTIONARY_ID,
             target_id=config.TARGET_MARKER_ID,
             smooth_window=config.POSE_SMOOTH_WINDOW,
-            smooth_alpha=0.90
+            smooth_alpha=0.90,
+            fast_miss_after=config.ARUCO_FAST_MISS_AFTER,
+            max_coasting_frames=config.MAX_COASTING_FRAMES,
+            enhanced_scan_interval=config.ARUCO_ENHANCED_SCAN_INTERVAL
         )
         self.map_trans = MapTransformer(
             map_width=config.WINDOW_WIDTH,
             map_height=config.WINDOW_HEIGHT
         )
         self.map_trans.matrix = np.eye(3, dtype=np.float32)
+        self.obstacle_detector = YOLOObstacleDetector(
+            OBSTACLE_MODEL_PATH,
+            image_size=320,
+            box_scale=config.OBSTACLE_BOX_SCALE,
+        )
+        print(f"[장애물 모델] YOLO 모델 로드 완료: {OBSTACLE_MODEL_PATH}")
+        print(
+            f"[초음파 경로 재탐색] "
+            f"{'활성화' if config.ENABLE_ULTRASONIC_REPLANNING == 1 else '비활성화'}"
+        )
 
         self.nav = StarcraftNavigator(
             kp_angle=config.KP_ANGLE,
@@ -130,6 +149,7 @@ class StarcraftRCApp:
             kp_dist=config.KP_DIST,
             kd_dist=config.KD_DIST,
             rot_threshold_deg=config.ROTATION_THRESHOLD_DEG,
+            forward_alignment_threshold_deg=config.FORWARD_ALIGNMENT_THRESHOLD_DEG,
             waypoint_dist_px=config.WAYPOINT_REACH_DIST_PX,
             final_goal_dist_px=config.FINAL_GOAL_REACH_DIST_PX,
             max_speed=config.MAX_PWM_SPEED,
@@ -139,6 +159,8 @@ class StarcraftRCApp:
             diff_weight=config.DIFF_STEER_WEIGHT,
             robot_radius_px=config.ROBOT_RADIUS_PX,
             grid_size=config.GRID_CELL_SIZE,
+            astar_extra_safety_margin_px=config.ASTAR_EXTRA_SAFETY_MARGIN_PX,
+            waypoint_spacing_px=config.PATH_WAYPOINT_SPACING_PX,
             step_drive_enabled=config.STEP_DRIVE_ENABLED,
             step_move_sec=config.STEP_MOVE_SEC,
             step_pause_sec=config.STEP_PAUSE_SEC
@@ -170,37 +192,31 @@ class StarcraftRCApp:
         self.last_robot_pos = None
         self.last_robot_angle = 0.0
         
-        self.show_hsv_controls = False
-        self.last_hsv_toggle_time = 0.0
+        self.latest_obstacle_mask = None
+        self.latest_detections = []
+        self.last_ultrasonic_log_time = 0.0
+        self.frame_count = 0
+        self.last_detection_mask = None
+        self.last_detections = []
+        self.last_detection_time = 0.0
+        self.static_obstacle_mask = None
+        self.static_detections = []
+        self.auto_canvas = None
+        self.fps = 0.0
+        self.fps_window_start = time.monotonic()
+        self.fps_window_frames = 0
+        self._camera_lock = threading.Lock()
+        self._camera_stop = threading.Event()
+        self._latest_camera_frame = None
+        self._camera_thread = None
+        if self.has_camera:
+            self._camera_thread = threading.Thread(
+                target=self._camera_capture_loop,
+                name="main-camera-capture",
+                daemon=True,
+            )
+            self._camera_thread.start()
 
-        # txt 파일 기반 HSV 및 반경 설정 관리 (영구 유지)
-        self.hsv_settings_file = os.path.join(CURRENT_DIR, "hsv_settings.txt")
-        saved_settings = load_hsv_settings(
-            self.hsv_settings_file,
-            [config.DEFAULT_BLUE_H_MIN, config.DEFAULT_BLUE_H_MAX, config.DEFAULT_BLUE_S_MIN, config.DEFAULT_BLUE_V_MIN],
-            [config.DEFAULT_GREEN_H_MIN, config.DEFAULT_GREEN_H_MAX, config.DEFAULT_GREEN_S_MIN, config.DEFAULT_GREEN_V_MIN],
-            config.DEFAULT_BLUE_RADIUS_X,
-            config.DEFAULT_BLUE_RADIUS_Y
-        )
-        self.blue_obstacle_radius_x = saved_settings["blue_radius_x"]
-        self.blue_obstacle_radius_y = saved_settings["blue_radius_y"]
-        self.blue_hsv = [
-            saved_settings["blue_h_min"],
-            saved_settings["blue_h_max"],
-            saved_settings["blue_s_min"],
-            saved_settings["blue_v_min"]
-        ]
-        self.green_hsv = [
-            saved_settings["green_h_min"],
-            saved_settings["green_h_max"],
-            saved_settings["green_s_min"],
-            saved_settings["green_v_min"]
-        ]
-        self.latest_blue_mask = None
-        self.latest_green_mask = None
-        self.latest_total_obstacle = None
-        self.latest_cone_base_points = []
-        
         # --- 수동 조작 모드 및 페이드 효과 상태 변수 ---
         self.manual_mode = False
         self.manual_vl = 0.0
@@ -214,11 +230,8 @@ class StarcraftRCApp:
         self.fade_progress = 0.0
         self.fade_start_time = 0.0
         self.is_fading = False
-        self.fade_target = False # True = manual, False = auto
+        self.fade_target = False
 
-        # --- pynput OS 레벨 키 상태 추적 ---
-        # cv2.waitKey는 OpenCV 윈도우에 포커스가 없으면 입력이 막혀 WASD가 작동 안 함
-        # pynput으로 OS 레벨에서 현재 눌린 키 집합을 추적
         self._pressed_keys: set = set()
         self._key_listener = pynput_keyboard.Listener(
             on_press=self._on_key_press,
@@ -227,11 +240,46 @@ class StarcraftRCApp:
         self._key_listener.daemon = True
         self._key_listener.start()
 
-        # 윈도우 생성 및 마우스 콜백 등록
         cv2.namedWindow(config.WINDOW_TITLE, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(config.WINDOW_TITLE, config.WINDOW_WIDTH, config.WINDOW_HEIGHT)
         cv2.setMouseCallback(config.WINDOW_TITLE, self._on_mouse_event)
 
+    @staticmethod
+    def _box_iou(box_a, box_b) -> float:
+        ax, ay, aw, ah = box_a
+        bx, by, bw, bh = box_b
+        x1, y1 = max(ax, bx), max(ay, by)
+        x2, y2 = min(ax + aw, bx + bw), min(ay + ah, by + bh)
+        intersection = max(0, x2 - x1) * max(0, y2 - y1)
+        union = aw * ah + bw * bh - intersection
+        return intersection / union if union else 0.0
+
+    def _remember_obstacles(self, detections, mask):
+        if not config.OBSTACLE_MEMORY_ENABLED:
+            return detections, mask
+        if self.static_obstacle_mask is None or self.static_obstacle_mask.shape != mask.shape:
+            self.static_obstacle_mask = np.zeros_like(mask)
+        self.static_obstacle_mask = cv2.bitwise_or(self.static_obstacle_mask, mask)
+        for detection in detections:
+            if not any(
+                self._box_iou(detection.box, old.box) >= 0.35
+                for old in self.static_detections
+            ):
+                self.static_detections.append(detection)
+        return self.static_detections, self.static_obstacle_mask
+
+    def _camera_capture_loop(self):
+        while not self._camera_stop.is_set():
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                with self._camera_lock:
+                    self._latest_camera_frame = frame
+
+    def _get_latest_camera_frame(self):
+        with self._camera_lock:
+            if self._latest_camera_frame is None:
+                return None
+            return self._latest_camera_frame.copy()
     def _get_total_obstacle_mask(
         self,
         blue_mask: Optional[np.ndarray],
@@ -253,6 +301,50 @@ class StarcraftRCApp:
             return cv2.bitwise_or(base_obs, non_green)
 
         return base_obs
+
+    def _add_ultrasonic_obstacles(
+        self,
+        mask: np.ndarray,
+        detections: List[Detection],
+        robot_pos: Optional[Tuple[int, int]],
+        robot_angle_deg: float,
+    ) -> None:
+        """좌우 초음파 측정값을 영상 좌표의 가상 장애물 객체로 변환한다."""
+        if robot_pos is None:
+            return
+        reading = self.motor.get_ultrasonic_reading()
+        height, width = mask.shape[:2]
+        for side, distance_cm in (("LEFT", reading["left_cm"]), ("RIGHT", reading["right_cm"])):
+            if not 1.0 <= distance_cm < ULTRASONIC_MAX_RANGE_CM - 1.0:
+                continue
+            relative_angle = -35.0 if side == "LEFT" else 35.0
+            distance_m = distance_cm / 100.0
+            heading = math.radians(robot_angle_deg + relative_angle)
+            distance_px = distance_m * ULTRASONIC_PIXELS_PER_METER
+            center_x = int(robot_pos[0] + math.cos(heading) * distance_px)
+            center_y = int(robot_pos[1] - math.sin(heading) * distance_px)
+            box_size = int(np.clip(45 + (20.0 - distance_cm) * 1.5, 35, 75))
+            x1 = int(np.clip(center_x - box_size, 0, width - 1))
+            y1 = int(np.clip(center_y - box_size, 0, height - 1))
+            x2 = int(np.clip(center_x + box_size, 0, width - 1))
+            y2 = int(np.clip(center_y + box_size, 0, height - 1))
+            if x2 <= x1 or y2 <= y1:
+                continue
+            cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
+            ultrasonic_box = (x1, y1, x2 - x1, y2 - y1)
+            if not any(
+                detection.label == f"ultrasonic {side.lower()}"
+                and self._box_iou(detection.box, ultrasonic_box) >= 0.35
+                for detection in detections
+            ):
+                detections.append(
+                    Detection(
+                        box=ultrasonic_box,
+                        confidence=1.0,
+                        class_id=-1,
+                        label=f"ultrasonic {side.lower()}",
+                    )
+                )
 
     def _init_camera_focus(self):
         # 포커스를 흔들어 오토포커스 재기동 ('F' 키 기능)
@@ -307,31 +399,6 @@ class StarcraftRCApp:
                 self._toggle_manual_mode()
                 return
 
-            # 옵션창 버튼 클릭 영역 (x: 981~1058, y: 609~630)
-            if 981 <= x <= 1058 and 609 <= y <= 630:
-                now = time.time()
-                # 더블클릭으로 인해 열리자마자 바로 닫히는 현상 방지 (0.35초 디바운스)
-                if now - self.last_hsv_toggle_time < 0.35:
-                    return
-                self.last_hsv_toggle_time = now
-
-                is_open = False
-                try:
-                    if cv2.getWindowProperty("HSV Controls", cv2.WND_PROP_VISIBLE) >= 1:
-                        is_open = True
-                except Exception:
-                    is_open = False
-
-                if is_open:
-                    self.show_hsv_controls = False
-                    cv2.destroyWindow("HSV Controls")
-                    print("[옵션] HSV 조절창을 닫았습니다.")
-                else:
-                    self.show_hsv_controls = True
-                    self._setup_hsv_controls()
-                    print("[옵션] 초록/파랑 HSV 및 반경 조절창을 열었습니다.")
-                return
-
             clicked_btn = self.button_manager.handle_mouse_down(x, y)
             if clicked_btn is not None:
                 if clicked_btn == "exit":
@@ -343,9 +410,7 @@ class StarcraftRCApp:
                 elif clicked_btn == "recall":
                     target_home = self.home_pos if self.home_pos is not None else (640, 360)
                     if self.last_robot_pos is not None:
-                        total_obs = self._get_total_obstacle_mask(
-                            self.latest_blue_mask, self.latest_green_mask, self.latest_cone_base_points
-                        )
+                        total_obs = self.latest_obstacle_mask
                         self.nav.set_goal(self.last_robot_pos, target_home, total_obs)
                     else:
                         print("[오류] 마커 미인식")
@@ -366,9 +431,7 @@ class StarcraftRCApp:
             cam_y = int(y * config.WINDOW_HEIGHT / CAM_H)
             
             if self.last_robot_pos is not None:
-                total_obs = self._get_total_obstacle_mask(
-                    self.latest_blue_mask, self.latest_green_mask, self.latest_cone_base_points
-                )
+                total_obs = self.latest_obstacle_mask
                 self.nav.set_goal(self.last_robot_pos, (cam_x, cam_y), total_obs)
             else:
                 print(f"[명령 대기] 마커 미인식 (목표: {cam_x}, {cam_y})")
@@ -494,6 +557,8 @@ class StarcraftRCApp:
 
     def run(self):
         while self.is_running:
+            loop_start = time.monotonic()
+            self.frame_count += 1
             # ── 키보드 입력 처리 ──────────────────────────────────
             key = cv2.waitKey(1) & 0xFF
             if key == 27: # ESC
@@ -507,8 +572,8 @@ class StarcraftRCApp:
             # ── 영상 데이터 준비 ───────────────────────────────────
             # 메인 관제 카메라 프레임
             if self.has_camera:
-                ret, frame = self.cap.read()
-                if not ret or frame is None:
+                frame = self._get_latest_camera_frame()
+                if frame is None:
                     frame = np.zeros((config.WINDOW_HEIGHT, config.WINDOW_WIDTH, 3), dtype=np.uint8)
             else:
                 frame = np.zeros((config.WINDOW_HEIGHT, config.WINDOW_WIDTH, 3), dtype=np.uint8)
@@ -521,24 +586,28 @@ class StarcraftRCApp:
             # ── 자동 모드용 데이터 연산 (페이드 중이거나 자동 모드일 때) ──
             ui_output = None
             if not self.manual_mode or self.is_fading:
-                self._update_hsv_from_trackbars()
-                hsv_map = cv2.cvtColor(warped_map, cv2.COLOR_BGR2HSV)
-                blue_mask, cone_base_points = self.map_trans.extract_blue_obstacle_mask(
-                    hsv_map,
-                    h_min=self.blue_hsv[0], h_max=self.blue_hsv[1],
-                    s_min=self.blue_hsv[2], v_min=self.blue_hsv[3],
-                    dilate_x=self.blue_obstacle_radius_x,
-                    dilate_y=self.blue_obstacle_radius_y
+                now = time.monotonic()
+                should_refresh_obstacles = (
+                    self.last_detection_mask is None
+                    or now - self.last_detection_time >= config.OBSTACLE_REFRESH_INTERVAL_SEC
                 )
-                green_mask = self.map_trans.extract_green_terrain_mask(
-                    hsv_map,
-                    h_min=self.green_hsv[0], h_max=self.green_hsv[1],
-                    s_min=self.green_hsv[2], v_min=self.green_hsv[3]
-                )
-                self.latest_blue_mask = blue_mask
-                self.latest_green_mask = green_mask
-                self.latest_cone_base_points = cone_base_points
-                self.latest_total_obstacle = self._get_total_obstacle_mask(blue_mask, green_mask, cone_base_points)
+                if should_refresh_obstacles:
+                    current_detections, current_mask = self.obstacle_detector.detect(warped_map)
+                    self.last_detections = current_detections
+                    self.last_detection_mask = current_mask
+                    self._remember_obstacles(current_detections, current_mask)
+                    self.last_detection_time = now
+                    detections = current_detections
+                    obstacle_mask = self.static_obstacle_mask if config.OBSTACLE_MEMORY_ENABLED else current_mask
+                else:
+                    detections = self.last_detections
+                    obstacle_mask = (
+                        self.static_obstacle_mask
+                        if config.OBSTACLE_MEMORY_ENABLED and self.static_obstacle_mask is not None
+                        else self.last_detection_mask.copy()
+                    )
+                self.latest_detections = detections
+                self.latest_obstacle_mask = obstacle_mask
 
                 robot_pos, robot_angle, corners, is_tracked, _ = self.tracker.detect(warped_map)
                 
@@ -554,11 +623,25 @@ class StarcraftRCApp:
                         side2 = float(np.linalg.norm(pts[3] - pts[2]))
                         side3 = float(np.linalg.norm(pts[0] - pts[3]))
                         avg_side = (side0 + side1 + side2 + side3) / 4.0
-                        self.nav.planner.robot_radius_px = max(60, int(avg_side * 1.6))
+                        self.nav.planner.robot_radius_px = max(
+                            60,
+                            int(avg_side * config.ROBOT_BODY_LENGTH_SCALE / 2.0),
+                            int(avg_side * config.ROBOT_BODY_WIDTH_SCALE / 2.0),
+                        )
 
                     if self.home_pos is None:
                         self.home_pos = robot_pos
                         print(f"[홈 등록] 초기 위치: {self.home_pos}")
+
+                if config.ENABLE_ULTRASONIC_REPLANNING == 1:
+                    self._add_ultrasonic_obstacles(
+                        obstacle_mask,
+                        detections,
+                        robot_pos,
+                        robot_angle,
+                    )
+                self.latest_detections = detections
+                self.latest_obstacle_mask = obstacle_mask
 
                 # ArUco 5초 미감지 체크 (화면 안내창 플래그 설정)
                 show_lost_warning = False
@@ -567,13 +650,31 @@ class StarcraftRCApp:
                         show_lost_warning = True
                 self.show_lost_warning = show_lost_warning
 
+                # YOLO 또는 초음파 가상 장애물이 현재 A* 경로를 침범하면 재탐색
+                if (
+                    not self.manual_mode
+                    and robot_pos is not None
+                    and self.nav.final_goal is not None
+                    and self.nav.is_current_path_blocked(self.latest_obstacle_mask, robot_pos)
+                ):
+                    print("[A*] 장애물 객체가 현재 경로를 차단함 -> 경로 재탐색")
+                    self.nav.set_goal(
+                        robot_pos,
+                        self.nav.final_goal,
+                        self.latest_obstacle_mask,
+                    )
+
                 # 주행 제어 업데이트 (자동 모드일 때만 전송)
                 v_left, v_right, nav_state = self.nav.update_control(robot_pos, robot_angle)
                 if not self.manual_mode and not self.is_fading:
                     self.motor.send_speed(v_left, v_right)
 
                 # 자동 모드 렌더링 준비
-                auto_canvas = self.renderer.render_frame(
+                if (
+                    self.auto_canvas is None
+                    or self.frame_count % max(1, config.RENDER_INTERVAL) == 0
+                ):
+                    self.auto_canvas = self.renderer.render_frame(
                     main_view=warped_map,
                     log_lines=self.logger.log_lines,
                     robot_pos=robot_pos,
@@ -581,8 +682,8 @@ class StarcraftRCApp:
                     waypoints=self.nav.waypoints,
                     current_wp_idx=self.nav.current_wp_idx,
                     goal_pos=self.nav.final_goal,
-                    blue_mask=blue_mask,
-                    green_mask=green_mask,
+                    obstacle_mask=obstacle_mask,
+                    detections=detections,
                     ping_pos=self.nav.ping_pos,
                     ping_start_time=self.nav.ping_start_time,
                     mouse_pos=(self.mouse_x, self.mouse_y),
@@ -592,10 +693,11 @@ class StarcraftRCApp:
                     home_pos=self.home_pos,
                     is_blind=False,
                     ip_address=config.RASPBERRY_PI_IP,
-                    cone_base_points=self.latest_cone_base_points,
                     pi_cam_frame=self.pi_cam.get_latest_frame(),
-                    show_lost_warning=show_lost_warning
-                )
+                    show_lost_warning=show_lost_warning,
+                        fps=self.fps
+                    )
+                auto_canvas = self.auto_canvas
 
             # ── 수동 모드 연산 및 제어 (페이드 중이거나 수동 모드일 때) ──
             if self.manual_mode or self.is_fading:
@@ -634,6 +736,12 @@ class StarcraftRCApp:
                 ui_output = auto_canvas
 
             cv2.imshow(config.WINDOW_TITLE, ui_output)
+            self.fps_window_frames += 1
+            elapsed = time.monotonic() - self.fps_window_start
+            if elapsed >= 1.0:
+                self.fps = self.fps_window_frames / elapsed
+                self.fps_window_frames = 0
+                self.fps_window_start = time.monotonic()
             
             if cv2.getWindowProperty(config.WINDOW_TITLE, cv2.WND_PROP_VISIBLE) < 1:
                 break
@@ -641,14 +749,6 @@ class StarcraftRCApp:
         self.cleanup()
 
     def cleanup(self):
-        # 최종 HSV 및 반경 설정 저장
-        save_hsv_settings(
-            self.hsv_settings_file,
-            self.blue_hsv,
-            self.green_hsv,
-            self.blue_obstacle_radius_x,
-            self.blue_obstacle_radius_y
-        )
         self.motor.stop()
         self.motor.close()
         self.pi_cam.stop()
@@ -657,6 +757,9 @@ class StarcraftRCApp:
         except Exception:
             pass
         if self.has_camera:
+            self._camera_stop.set()
+            if self._camera_thread is not None:
+                self._camera_thread.join(timeout=1.0)
             self.cap.release()
         cv2.destroyAllWindows()
         self.logger.restore()

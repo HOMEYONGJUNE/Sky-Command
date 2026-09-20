@@ -4,6 +4,7 @@ import time
 from typing import List, Optional, Tuple
 import cv2
 import numpy as np
+import config
 try:
     from PIL import Image, ImageDraw, ImageFont, ImageSequence
     _PIL_AVAILABLE = True
@@ -272,8 +273,8 @@ class UIRenderer:
         waypoints: Optional[List[Tuple[int, int]]] = None,
         current_wp_idx: int = 0,
         goal_pos: Optional[Tuple[int, int]] = None,
-        blue_mask: Optional[np.ndarray] = None,
-        green_mask: Optional[np.ndarray] = None,
+        obstacle_mask: Optional[np.ndarray] = None,
+        detections: Optional[list] = None,
         ping_pos: Optional[Tuple[int, int]] = None,
         ping_start_time: float = 0.0,
         mouse_pos: Tuple[int, int] = (0, 0),
@@ -283,9 +284,9 @@ class UIRenderer:
         home_pos: Optional[Tuple[int, int]] = None,
         is_blind: bool = False,
         ip_address: str = "192.168.0.2",
-        cone_base_points: Optional[List[Tuple[int, int]]] = None,
         pi_cam_frame: Optional[np.ndarray] = None,
-        show_lost_warning: bool = False
+        show_lost_warning: bool = False,
+        fps: float = 0.0,
     ) -> np.ndarray:
         CAM_W, CAM_H = 1090, 614
 
@@ -295,31 +296,43 @@ class UIRenderer:
 
         cam_frame = cv2.resize(main_view, (CAM_W, CAM_H))
         canvas[0:CAM_H, 0:CAM_W] = cam_frame
+        cv2.putText(
+            canvas,
+            f"FPS: {fps:4.1f}",
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
 
-        # 2. 장애물 마스크 오버레이 및 선명한 테두리선(Outline) - 최적화 적용
-        if blue_mask is not None and np.count_nonzero(blue_mask) > 0:
-            blue_mask_cam = cv2.resize(blue_mask, (CAM_W, CAM_H), interpolation=cv2.INTER_NEAREST)
-            # copy 연산 제거하고 직접 색상 덮어쓰기 후 테두리만 그려서 속도 향상 (addWeighted 최소화)
-            canvas[0:CAM_H, 0:CAM_W][blue_mask_cam > 0] = (255, 60, 60)
-            
-            # 단일 테두리선으로 간소화
-            obs_contours, _ = cv2.findContours(blue_mask_cam, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cv2.drawContours(canvas[0:CAM_H, 0:CAM_W], obs_contours, -1, (0, 70, 255), 1, cv2.LINE_AA)
+        # 최신 장애물 검출 위치를 메인 카메라 화면에 표시한다.
+        if detections:
+            scale_x = CAM_W / self.window_w
+            scale_y = CAM_H / self.window_h
+            for detection in detections:
+                x, y, width, height = detection.box
+                p1 = (int(x * scale_x), int(y * scale_y))
+                p2 = (int((x + width) * scale_x), int((y + height) * scale_y))
+                cv2.rectangle(canvas[0:CAM_H, 0:CAM_W], p1, p2, (0, 165, 255), 2)
+                cv2.putText(
+                    canvas[0:CAM_H, 0:CAM_W],
+                    f"{detection.label} {detection.confidence:.2f}",
+                    (p1[0], max(16, p1[1] - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (0, 165, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
 
         def sc(pt):
             return (int(pt[0] * CAM_W / self.window_w), int(pt[1] * CAM_H / self.window_h))
 
-        # 2-1. 파란색 꼬깔의 맨 아래쪽 바닥 픽셀을 빨간 점(RED DOT)으로 시각화
-        if cone_base_points:
-            for bx, by in cone_base_points:
-                sbp = sc((bx, by))
-                # 채워진 빨간 원 (반경 5px) + 흰색 테두리(가시성 극대화) + 십자선 마커
-                cv2.circle(canvas[0:CAM_H, 0:CAM_W], sbp, 5, (0, 0, 255), -1, cv2.LINE_AA)
-                cv2.circle(canvas[0:CAM_H, 0:CAM_W], sbp, 6, (255, 255, 255), 1, cv2.LINE_AA)
-                cv2.drawMarker(canvas[0:CAM_H, 0:CAM_W], sbp, (255, 255, 255), cv2.MARKER_CROSS, 8, 1, cv2.LINE_AA)
-
-        # 3. ArUco 마커 외곽선 및 RC카 원형 차체 영역 (원형 차체 1.6배 확장 크기)
-        car_radius_screen = int(93 * CAM_W / self.window_w)
+        # 3. ArUco 위치/방향을 기준으로 직사각형 차체 표시
+        car_half_length = 0
+        car_half_width = 0
         center_screen = None
 
         if marker_corners is not None and len(marker_corners) >= 4:
@@ -333,9 +346,14 @@ class UIRenderer:
             side3 = float(np.linalg.norm(mc_pts[0] - mc_pts[3]))
             avg_side = (side0 + side1 + side2 + side3) / 4.0
 
-            # 원형 차체 반경 (마커 한 변 * 1.6)
-            car_radius_px = avg_side * 1.6
-            car_radius_screen = int(car_radius_px * CAM_W / self.window_w)
+            car_half_width = max(
+                10,
+                int(avg_side * config.ROBOT_BODY_WIDTH_SCALE * CAM_W / self.window_w / 2.0),
+            )
+            car_half_length = max(
+                car_half_width,
+                int(avg_side * config.ROBOT_BODY_LENGTH_SCALE * CAM_H / self.window_h / 2.0),
+            )
 
             # ArUco 마커 외곽선 (초록색 1px)
             scaled_marker = np.array([[sc(p)] for p in mc_pts], dtype=np.int32)
@@ -344,12 +362,26 @@ class UIRenderer:
         elif robot_pos is not None:
             center_screen = sc(robot_pos)
 
-        # 원형 차체 렌더링 (반투명 채우기 + 2px 외곽선 원)
-        if center_screen is not None and car_radius_screen > 0:
+        # 헤딩 방향을 따라 회전한 직사각형 차체 렌더링
+        if center_screen is not None and car_half_length > 0 and car_half_width > 0:
+            rad = math.radians(robot_angle_deg)
+            heading = np.array((math.cos(rad), -math.sin(rad)), dtype=np.float32)
+            lateral = np.array((math.sin(rad), math.cos(rad)), dtype=np.float32)
+            center = np.array(center_screen, dtype=np.float32)
+            rectangle = np.array(
+                [
+                    center + heading * car_half_length + lateral * car_half_width,
+                    center + heading * car_half_length - lateral * car_half_width,
+                    center - heading * car_half_length - lateral * car_half_width,
+                    center - heading * car_half_length + lateral * car_half_width,
+                ],
+                dtype=np.int32,
+            )
+
             car_overlay = canvas.copy()
-            cv2.circle(car_overlay, center_screen, car_radius_screen, (255, 200, 0), -1, cv2.LINE_AA)
+            cv2.fillConvexPoly(car_overlay, rectangle, (255, 200, 0), cv2.LINE_AA)
             canvas = cv2.addWeighted(canvas, 0.75, car_overlay, 0.25, 0)
-            cv2.circle(canvas, center_screen, car_radius_screen, (255, 235, 50), 2, cv2.LINE_AA)
+            cv2.polylines(canvas, [rectangle], True, (255, 235, 50), 2, cv2.LINE_AA)
 
         # 로봇 중심점 및 헤딩 방향선 (슬림 1px)
         if robot_pos is not None:
@@ -357,7 +389,10 @@ class UIRenderer:
             cv2.circle(canvas, srp, 3, (255, 255, 255), -1, cv2.LINE_AA)
 
             rad = math.radians(robot_angle_deg)
-            arrow_len = max(24, car_radius_screen + 8 if center_screen is not None else 24)
+            arrow_len = max(
+                24,
+                car_half_length + 8 if center_screen is not None else 24,
+            )
             ax = int(srp[0] + arrow_len * math.cos(rad))
             ay = int(srp[1] - arrow_len * math.sin(rad))
             cv2.line(canvas, srp, (ax, ay), (0, 255, 255), 2, cv2.LINE_AA)
@@ -439,18 +474,12 @@ class UIRenderer:
                     int(pt[1] * MM_H / self.window_h)
                 )
 
-            # 파란 장애물 → 어두운 파란색 및 테두리선
-            if blue_mask is not None and np.count_nonzero(blue_mask) > 0:
-                mini_mask = cv2.resize(blue_mask, (MM_W, MM_H), interpolation=cv2.INTER_NEAREST)
+            # TFLite 장애물 영역을 미니맵에 표시
+            if obstacle_mask is not None and np.count_nonzero(obstacle_mask) > 0:
+                mini_mask = cv2.resize(obstacle_mask, (MM_W, MM_H), interpolation=cv2.INTER_NEAREST)
                 minimap[mini_mask > 0] = (0, 0, 200)
                 mini_contours, _ = cv2.findContours(mini_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                cv2.drawContours(minimap, mini_contours, -1, (0, 150, 255), 1, cv2.LINE_AA)
-
-            # 미니맵 꼬깔 바닥점 빨간 점
-            if cone_base_points:
-                for bx, by in cone_base_points:
-                    mbp = mm((bx, by))
-                    cv2.circle(minimap, mbp, 3, (0, 0, 255), -1, cv2.LINE_AA)
+                cv2.drawContours(minimap, mini_contours, -1, (0, 165, 255), 1, cv2.LINE_AA)
 
             if waypoints and len(waypoints) > 0 and robot_pos is not None:
                 remaining_wps = waypoints[current_wp_idx:] if current_wp_idx < len(waypoints) else []

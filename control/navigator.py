@@ -26,6 +26,7 @@ class StarcraftNavigator:
         kp_dist: float = 0.65,
         kd_dist: float = 0.08,
         rot_threshold_deg: float = 25.0,
+        forward_alignment_threshold_deg: float = 5.0,
         waypoint_dist_px: float = 40.0,
         final_goal_dist_px: float = 30.0,
         max_speed: int = 150,
@@ -35,6 +36,8 @@ class StarcraftNavigator:
         diff_weight: float = 38.0,
         robot_radius_px: int = 38,
         grid_size: int = 12,
+        astar_extra_safety_margin_px: int = 28,
+        waypoint_spacing_px: float = 24.0,
         step_drive_enabled: bool = True,
         step_move_sec: float = 0.22,
         step_pause_sec: float = 0.09
@@ -44,6 +47,7 @@ class StarcraftNavigator:
         self.kp_dist = kp_dist
         self.kd_dist = kd_dist
         self.rot_threshold_deg = rot_threshold_deg
+        self.forward_alignment_threshold_deg = forward_alignment_threshold_deg
         self.waypoint_dist_px = waypoint_dist_px
         self.final_goal_dist_px = final_goal_dist_px
         self.max_speed = max_speed
@@ -58,7 +62,12 @@ class StarcraftNavigator:
         self.step_pause_sec = step_pause_sec
         self.step_start_time = time.time()
 
-        self.planner = AStarPlanner(robot_radius_px=robot_radius_px, grid_size=grid_size)
+        self.planner = AStarPlanner(
+            robot_radius_px=robot_radius_px,
+            grid_size=grid_size,
+            extra_safety_margin_px=astar_extra_safety_margin_px,
+        )
+        self.waypoint_spacing_px = max(4.0, float(waypoint_spacing_px))
 
         # 경로 및 목표 상태
         self.final_goal: Optional[Tuple[int, int]] = None
@@ -116,7 +125,7 @@ class StarcraftNavigator:
         if not path:
             path = [robot_pos, goal_pos]
 
-        self.waypoints = path
+        self.waypoints = self._densify_path(path)
 
         # 첫 번째 점 시작 인덱스 결정
         if len(self.waypoints) > 1:
@@ -127,6 +136,25 @@ class StarcraftNavigator:
 
         self.state = NavState.MOVING
         print(f"[NAV] 목표 이동: {goal_pos} (웨이포인트 {len(self.waypoints)}개)")
+
+    def _densify_path(self, path: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+        """A*의 긴 선분을 촘촘한 체크포인트로 나눠 코너 진입을 정밀하게 한다."""
+        if len(path) < 2:
+            return path
+
+        dense_path = [path[0]]
+        for start, end in zip(path, path[1:]):
+            distance = math.hypot(end[0] - start[0], end[1] - start[1])
+            steps = max(1, int(math.ceil(distance / self.waypoint_spacing_px)))
+            for step in range(1, steps + 1):
+                ratio = step / steps
+                point = (
+                    int(round(start[0] + (end[0] - start[0]) * ratio)),
+                    int(round(start[1] + (end[1] - start[1]) * ratio)),
+                )
+                if point != dense_path[-1]:
+                    dense_path.append(point)
+        return dense_path
 
     def return_to_home(
         self,
@@ -201,12 +229,8 @@ class StarcraftNavigator:
         v_raw = (self.kp_dist * dist_to_wp) + (self.kd_dist * dist_deriv)
         self.prev_dist_error = dist_to_wp
 
-        # 5. 각도 오차에 따라 회전/전진 분기 (히스테리시스로 채터링/뒤뚱거림 억제)
-        # 회전 중일 때는 55% 각도(약 15도)까지 충분히 정렬된 후 전진으로 전환
-        rot_threshold = self.rot_threshold_deg if self.state != NavState.ROTATING else (self.rot_threshold_deg * 0.55)
-
-        if abs(angle_error_deg) > rot_threshold:
-            # 제자리 회전
+        # 5. 경로 방향과 차체 전방이 5도 미만으로 정렬된 경우에만 전진
+        if abs(angle_error_deg) >= self.forward_alignment_threshold_deg:
             self.state = NavState.ROTATING
             # 각도 오차가 작아질수록 회전 PWM을 부드럽게 감속 (오버슈트/뒤뚱거림 원천 차단)
             scale = min(1.0, max(0.0, abs(angle_error_deg) / 50.0))
@@ -220,7 +244,7 @@ class StarcraftNavigator:
                 v_left = rot_magnitude
                 v_right = -rot_magnitude
         else:
-            # 전진 및 조향
+            # 방향이 충분히 정렬된 경우에만 전진
             self.state = NavState.MOVING
             
             # 스텝 주행 펄스 체크

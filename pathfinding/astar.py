@@ -6,10 +6,17 @@ import numpy as np
 
 
 class AStarPlanner:
-    def __init__(self, robot_radius_px: int = 38, grid_size: int = 12, smooth_path: bool = True):
+    def __init__(
+        self,
+        robot_radius_px: int = 38,
+        grid_size: int = 12,
+        smooth_path: bool = True,
+        extra_safety_margin_px: int = 28,
+    ):
         self.robot_radius_px = robot_radius_px
         self.grid_size = grid_size
         self.smooth_path = smooth_path
+        self.extra_safety_margin_px = max(0, int(extra_safety_margin_px))
         
         # 장애물 팽창용 커널
         k_size = int(robot_radius_px * 2) + 1
@@ -45,9 +52,9 @@ class AStarPlanner:
         cols = max(1, w // self.grid_size)
         rows = max(1, h // self.grid_size)
 
-        # 화면에 표시되는 파란색 뻥튀기 마스크(obstacle_mask)와 실제 A* 탐색 영역을 1:1로 직접 연동
-        # 이미 마스크 자체에 회피 마진이 반영되어 있으므로, 2차 과도 팽창을 제거하고 미세 마진만 적용
-        radii_to_try = [4, 0]
+        # 장애물 가장자리에서 차체가 충분히 떨어지도록 추가 안전 여유를 적용한다.
+        safety_margin = self.extra_safety_margin_px
+        radii_to_try = [safety_margin, max(0, safety_margin // 2), 0]
 
         # 스무딩 검사용 안전 맵 (화면상 뻥튀기 영역과 1:1)
         safety_check_map = obstacle_mask.copy()

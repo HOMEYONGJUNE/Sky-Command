@@ -20,6 +20,12 @@ except ImportError:
     print("[경고] gpiozero 없음 (시뮬레이션 모드)")
     GPIO_AVAILABLE = False
 
+try:
+    from gpiozero import DistanceSensor
+    ULTRASONIC_AVAILABLE = True
+except ImportError:
+    DistanceSensor = None
+    ULTRASONIC_AVAILABLE = False
 
 try:
     from picamera2 import Picamera2
@@ -260,7 +266,95 @@ else:
 
 UDP_IP = "0.0.0.0"
 UDP_PORT = 8080
+TELEMETRY_PORT = 8082
 WATCHDOG_TIMEOUT = 0.25
+# 전진/일반 주행 출력 게인 (기존 0.96에서 10% 하향)
+MOTOR_GAIN = 0.864
+# 좌우 모터가 반대 방향으로 도는 제자리 회전 출력 게인
+# 기존 0.80에서 15% 상향
+ROTATION_MOTOR_GAIN = 0.92
+ULTRASONIC_LOG_INTERVAL = 1.0
+ULTRASONIC_POLL_INTERVAL = 0.02
+ULTRASONIC_STOP_DISTANCE_M = 0.07
+ultrasonic_sensors = []
+ultrasonic_thread = None
+ultrasonic_running = False
+last_client_addr = None
+last_client_lock = threading.Lock()
+telemetry_sock = None
+
+
+def _ultrasonic_log_loop():
+    """센서를 빠르게 감시하고, 로그는 1초마다 관제 PC로 보낸다."""
+    last_log_time = 0.0
+    while ultrasonic_running:
+        try:
+            left = ultrasonic_sensors[0].distance * ultrasonic_sensors[0].max_distance
+            right = ultrasonic_sensors[1].distance * ultrasonic_sensors[1].max_distance
+            blocked = min(left, right) <= ULTRASONIC_STOP_DISTANCE_M
+
+            now = time.monotonic()
+            if now - last_log_time >= ULTRASONIC_LOG_INTERVAL:
+                print(
+                    f"[ULTRASONIC] left={left * 100:5.1f}cm "
+                    f"right={right * 100:5.1f}cm "
+                    f"stop={'YES' if blocked else 'NO'}",
+                    flush=True,
+                )
+                last_log_time = now
+
+            with last_client_lock:
+                client_addr = last_client_addr
+            if client_addr is not None:
+                telemetry = json.dumps({
+                    "left_cm": left * 100.0,
+                    "right_cm": right * 100.0,
+                    "blocked": blocked,
+                }).encode("utf-8")
+                if telemetry_sock is not None:
+                    try:
+                        telemetry_sock.sendto(telemetry, (client_addr[0], TELEMETRY_PORT))
+                    except OSError as e:
+                        print(f"[초음파 전송 오류] {e}", flush=True)
+        except Exception as e:
+            print(f"[초음파 센서 오류] {e}", flush=True)
+        time.sleep(ULTRASONIC_POLL_INTERVAL)
+
+
+def start_ultrasonic_monitor():
+    global ultrasonic_thread, ultrasonic_running
+    if not ULTRASONIC_AVAILABLE:
+        print("[초음파 경고] gpiozero DistanceSensor를 사용할 수 없습니다.", flush=True)
+        return
+    try:
+        ultrasonic_sensors.extend([
+            DistanceSensor(echo=17, trigger=4, max_distance=0.5, queue_len=5),
+            DistanceSensor(echo=15, trigger=14, max_distance=0.5, queue_len=5),
+        ])
+        ultrasonic_running = True
+        ultrasonic_thread = threading.Thread(
+            target=_ultrasonic_log_loop,
+            name="ultrasonic-monitor",
+            daemon=True,
+        )
+        ultrasonic_thread.start()
+        print("[초음파] 좌측 GPIO 4/17, 우측 GPIO 14/15 모니터 시작", flush=True)
+    except Exception as e:
+        print(f"[초음파 초기화 오류] {e}", flush=True)
+        ultrasonic_sensors.clear()
+
+
+def stop_ultrasonic_monitor():
+    global ultrasonic_running
+    ultrasonic_running = False
+    if ultrasonic_thread is not None:
+        ultrasonic_thread.join(timeout=1.5)
+    for sensor in ultrasonic_sensors:
+        try:
+            sensor.close()
+        except Exception:
+            pass
+    ultrasonic_sensors.clear()
 
 
 def stop_all():
@@ -274,6 +368,11 @@ def stop_all():
 def set_motors_raw(v_left: float, v_right: float):
     v_left = max(-255.0, min(255.0, float(v_left)))
     v_right = max(-255.0, min(255.0, float(v_right)))
+    # 좌우 명령의 부호가 반대이면 제자리 회전으로 판단한다.
+    is_rotation = v_left != 0.0 and v_right != 0.0 and (v_left * v_right < 0.0)
+    output_gain = ROTATION_MOTOR_GAIN if is_rotation else MOTOR_GAIN
+    v_left *= output_gain
+    v_right *= output_gain
 
     left_forward = (v_left >= 0)
     right_forward = (v_right >= 0)
@@ -307,6 +406,7 @@ def set_motors_raw(v_left: float, v_right: float):
 
 
 def main():
+    global last_client_addr, telemetry_sock
     parser = argparse.ArgumentParser(description="라즈베리 파이 RC카 모터 & 온보드 카메라 서버")
     parser.add_argument("--width", type=int, default=640, help="카메라 가로 해상도 (기본: 640, 고화질 720p: 1280)")
     parser.add_argument("--height", type=int, default=480, help="카메라 세로 해상도 (기본: 480, 고화질 720p: 720)")
@@ -325,9 +425,11 @@ def main():
         quality=args.quality
     )
     camera_streamer.start()
+    start_ultrasonic_monitor()
 
     # 2. 모터 제어 UDP 서버 시작 (포트 8080)
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    telemetry_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind((UDP_IP, UDP_PORT))
     sock.settimeout(WATCHDOG_TIMEOUT)
 
@@ -339,6 +441,8 @@ def main():
         while True:
             try:
                 data, addr = sock.recvfrom(1024)
+                with last_client_lock:
+                    last_client_addr = addr
                 msg = data.decode("utf-8").strip()
 
                 if "," in msg:
@@ -368,7 +472,9 @@ def main():
         print("\n[종료] 서버를 종료합니다.")
     finally:
         stop_all()
+        stop_ultrasonic_monitor()
         sock.close()
+        telemetry_sock.close()
         camera_streamer.stop()
         for device in ALL_DEVICES:
             try:
