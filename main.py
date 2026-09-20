@@ -630,7 +630,11 @@ class StarcraftRCApp:
                     current_detections, current_mask = self.obstacle_detector.detect(warped_map)
                     self.last_detections = current_detections
                     self.last_detection_mask = current_mask
-                    self._remember_obstacles(current_detections, current_mask)
+                    if config.OBSTACLE_MEMORY_ENABLED:
+                        self._remember_obstacles(current_detections, current_mask)
+                    else:
+                        self.static_obstacle_mask = None
+                        self.static_detections = []
                     self.last_detection_time = now
                     detections = current_detections
                     obstacle_mask = self.static_obstacle_mask if config.OBSTACLE_MEMORY_ENABLED else current_mask
@@ -668,13 +672,6 @@ class StarcraftRCApp:
                         self.home_pos = robot_pos
                         print(f"[홈 등록] 초기 위치: {self.home_pos}")
 
-                if config.ENABLE_ULTRASONIC_REPLANNING == 1:
-                    self._add_ultrasonic_obstacles(
-                        obstacle_mask,
-                        detections,
-                        robot_pos,
-                        robot_angle,
-                    )
                 ultrasonic_reversing = self._update_ultrasonic_emergency()
                 self.latest_detections = detections
                 self.latest_obstacle_mask = obstacle_mask
