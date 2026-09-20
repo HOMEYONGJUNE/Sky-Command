@@ -27,7 +27,7 @@ from pynput import keyboard as pynput_keyboard
 MANUAL_PWM = 100 # 수동 모드 모터 속도 (0~255)
 OBSTACLE_MODEL_PATH = os.path.join(CURRENT_DIR, "best.pt")
 ULTRASONIC_MAX_RANGE_CM = 50.0
-ULTRASONIC_PIXELS_PER_METER = 900.0
+ULTRASONIC_PIXELS_PER_METER = 500.0
 
 
 
@@ -199,6 +199,9 @@ class StarcraftRCApp:
         self.last_detection_mask = None
         self.last_detections = []
         self.last_detection_time = 0.0
+        self.ultrasonic_reverse_until = 0.0
+        self.ultrasonic_replan_pending = False
+        self.ultrasonic_trigger_latched = False
         self.static_obstacle_mask = None
         self.static_detections = []
         self.auto_canvas = None
@@ -315,7 +318,7 @@ class StarcraftRCApp:
         reading = self.motor.get_ultrasonic_reading()
         height, width = mask.shape[:2]
         for side, distance_cm in (("LEFT", reading["left_cm"]), ("RIGHT", reading["right_cm"])):
-            if not 1.0 <= distance_cm < ULTRASONIC_MAX_RANGE_CM - 1.0:
+            if not 1.0 <= distance_cm <= config.ULTRASONIC_EMERGENCY_DISTANCE_CM:
                 continue
             relative_angle = -35.0 if side == "LEFT" else 35.0
             distance_m = distance_cm / 100.0
@@ -323,7 +326,8 @@ class StarcraftRCApp:
             distance_px = distance_m * ULTRASONIC_PIXELS_PER_METER
             center_x = int(robot_pos[0] + math.cos(heading) * distance_px)
             center_y = int(robot_pos[1] - math.sin(heading) * distance_px)
-            box_size = int(np.clip(45 + (20.0 - distance_cm) * 1.5, 35, 75))
+            # 초음파 장애물은 센서 바로 앞의 작은 점유 객체로 표시한다.
+            box_size = int(np.clip(4 + (config.ULTRASONIC_EMERGENCY_DISTANCE_CM - distance_cm), 4, 7))
             x1 = int(np.clip(center_x - box_size, 0, width - 1))
             y1 = int(np.clip(center_y - box_size, 0, height - 1))
             x2 = int(np.clip(center_x + box_size, 0, width - 1))
@@ -345,6 +349,37 @@ class StarcraftRCApp:
                         label=f"ultrasonic {side.lower()}",
                     )
                 )
+
+    def _update_ultrasonic_emergency(self) -> bool:
+        """5cm 이내 감지 시 0.7초 후진 후 현재 장애물 기준으로 재탐색한다."""
+        if config.ENABLE_ULTRASONIC_REPLANNING != 1:
+            return False
+
+        reading = self.motor.get_ultrasonic_reading()
+        closest_cm = min(reading["left_cm"], reading["right_cm"])
+        now = time.monotonic()
+
+        if now < self.ultrasonic_reverse_until:
+            return True
+
+        if closest_cm >= config.ULTRASONIC_REARM_DISTANCE_CM:
+            self.ultrasonic_trigger_latched = False
+
+        if (
+            closest_cm <= config.ULTRASONIC_EMERGENCY_DISTANCE_CM
+            and not self.ultrasonic_trigger_latched
+        ):
+            self.ultrasonic_trigger_latched = True
+            self.ultrasonic_reverse_until = now + config.ULTRASONIC_REVERSE_SEC
+            self.ultrasonic_replan_pending = True
+            print(
+                f"[초음파 비상 회피] {closest_cm:.1f}cm 감지 -> "
+                f"{config.ULTRASONIC_REVERSE_SEC:.1f}초 후진 후 경로 재탐색",
+                flush=True,
+            )
+            return True
+
+        return False
 
     def _init_camera_focus(self):
         # 포커스를 흔들어 오토포커스 재기동 ('F' 키 기능)
@@ -640,6 +675,7 @@ class StarcraftRCApp:
                         robot_pos,
                         robot_angle,
                     )
+                ultrasonic_reversing = self._update_ultrasonic_emergency()
                 self.latest_detections = detections
                 self.latest_obstacle_mask = obstacle_mask
 
@@ -649,6 +685,21 @@ class StarcraftRCApp:
                     if time.time() - self.last_aruco_seen_time >= 5.0:
                         show_lost_warning = True
                 self.show_lost_warning = show_lost_warning
+
+                if (
+                    self.ultrasonic_replan_pending
+                    and not ultrasonic_reversing
+                    and not self.manual_mode
+                    and robot_pos is not None
+                    and self.nav.final_goal is not None
+                ):
+                    print("[A*] 초음파 장애물 반영 -> 경로 재탐색")
+                    self.nav.set_goal(
+                        robot_pos,
+                        self.nav.final_goal,
+                        self.latest_obstacle_mask,
+                    )
+                    self.ultrasonic_replan_pending = False
 
                 # YOLO 또는 초음파 가상 장애물이 현재 A* 경로를 침범하면 재탐색
                 if (
@@ -665,7 +716,12 @@ class StarcraftRCApp:
                     )
 
                 # 주행 제어 업데이트 (자동 모드일 때만 전송)
-                v_left, v_right, nav_state = self.nav.update_control(robot_pos, robot_angle)
+                if ultrasonic_reversing and not self.manual_mode and not self.is_fading:
+                    v_left = -config.ULTRASONIC_REVERSE_PWM
+                    v_right = -config.ULTRASONIC_REVERSE_PWM
+                    nav_state = NavState.MOVING
+                else:
+                    v_left, v_right, nav_state = self.nav.update_control(robot_pos, robot_angle)
                 if not self.manual_mode and not self.is_fading:
                     self.motor.send_speed(v_left, v_right)
 
