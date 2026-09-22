@@ -254,6 +254,8 @@ if GPIO_AVAILABLE:
     BACK_RIGHT_PWM = PWMLED(25)
 
     FRONT_RIGHT_BOOST = 1.2  # 오른쪽 앞바퀴 출력 보정
+    FRONT_LEFT_BOOST = 1.2  # 왼쪽 앞바퀴 출력 보정
+
 
     ALL_DEVICES = [
         FRONT_LEFT_PWM, FRONT_RIGHT_PWM, BACK_LEFT_PWM, BACK_RIGHT_PWM,
@@ -261,6 +263,8 @@ if GPIO_AVAILABLE:
     ]
 else:
     FRONT_RIGHT_BOOST = 1.2
+    FRONT_LEFT_BOOST = 1.2  # 왼쪽 앞바퀴 출력 보정
+
     ALL_DEVICES = []
 
 

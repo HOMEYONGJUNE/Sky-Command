@@ -202,6 +202,7 @@ class StarcraftRCApp:
         self.ultrasonic_reverse_until = 0.0
         self.ultrasonic_replan_pending = False
         self.ultrasonic_trigger_latched = False
+        self.ultrasonic_objects = {}
         self.static_obstacle_mask = None
         self.static_detections = []
         self.auto_canvas = None
@@ -305,50 +306,57 @@ class StarcraftRCApp:
 
         return base_obs
 
+    def _clear_ultrasonic_objects(self) -> None:
+        self.ultrasonic_objects.clear()
+
     def _add_ultrasonic_obstacles(
         self,
         mask: np.ndarray,
         detections: List[Detection],
         robot_pos: Optional[Tuple[int, int]],
         robot_angle_deg: float,
+        marker_size_px: float,
     ) -> None:
-        """좌우 초음파 측정값을 영상 좌표의 가상 장애물 객체로 변환한다."""
+        """좌우 초음파 장애물을 센서별로 한 번 생성해 현재 맵에 반영한다."""
         if robot_pos is None:
             return
+
         reading = self.motor.get_ultrasonic_reading()
         height, width = mask.shape[:2]
+        for side, detection in self.ultrasonic_objects.items():
+            x, y, box_width, box_height = detection.box
+            cv2.rectangle(mask, (x, y), (x + box_width, y + box_height), 255, -1)
+            if not any(existing.label == detection.label for existing in detections):
+                detections.append(detection)
+
         for side, distance_cm in (("LEFT", reading["left_cm"]), ("RIGHT", reading["right_cm"])):
+            if side in self.ultrasonic_objects:
+                continue
             if not 1.0 <= distance_cm <= config.ULTRASONIC_EMERGENCY_DISTANCE_CM:
                 continue
-            relative_angle = -35.0 if side == "LEFT" else 35.0
-            distance_m = distance_cm / 100.0
+
+            relative_angle = -30.0 if side == "LEFT" else 30.0
+            distance_px = (distance_cm / 100.0) * ULTRASONIC_PIXELS_PER_METER
             heading = math.radians(robot_angle_deg + relative_angle)
-            distance_px = distance_m * ULTRASONIC_PIXELS_PER_METER
             center_x = int(robot_pos[0] + math.cos(heading) * distance_px)
             center_y = int(robot_pos[1] - math.sin(heading) * distance_px)
-            # 초음파 장애물은 센서 바로 앞의 작은 점유 객체로 표시한다.
-            box_size = int(np.clip(4 + (config.ULTRASONIC_EMERGENCY_DISTANCE_CM - distance_cm), 4, 7))
-            x1 = int(np.clip(center_x - box_size, 0, width - 1))
-            y1 = int(np.clip(center_y - box_size, 0, height - 1))
-            x2 = int(np.clip(center_x + box_size, 0, width - 1))
-            y2 = int(np.clip(center_y + box_size, 0, height - 1))
+            box_size = max(4, int(round(marker_size_px * 0.60)))
+            x1 = int(np.clip(center_x - box_size // 2, 0, width - 1))
+            y1 = int(np.clip(center_y - box_size // 2, 0, height - 1))
+            x2 = int(np.clip(x1 + box_size, 0, width - 1))
+            y2 = int(np.clip(y1 + box_size, 0, height - 1))
             if x2 <= x1 or y2 <= y1:
                 continue
+
+            detection = Detection(
+                box=(x1, y1, x2 - x1, y2 - y1),
+                confidence=1.0,
+                class_id=-1,
+                label=f"ultrasonic {side.lower()}",
+            )
+            self.ultrasonic_objects[side] = detection
             cv2.rectangle(mask, (x1, y1), (x2, y2), 255, -1)
-            ultrasonic_box = (x1, y1, x2 - x1, y2 - y1)
-            if not any(
-                detection.label == f"ultrasonic {side.lower()}"
-                and self._box_iou(detection.box, ultrasonic_box) >= 0.35
-                for detection in detections
-            ):
-                detections.append(
-                    Detection(
-                        box=ultrasonic_box,
-                        confidence=1.0,
-                        class_id=-1,
-                        label=f"ultrasonic {side.lower()}",
-                    )
-                )
+            detections.append(detection)
 
     def _update_ultrasonic_emergency(self) -> bool:
         """5cm 이내 감지 시 0.7초 후진 후 현재 장애물 기준으로 재탐색한다."""
@@ -445,6 +453,7 @@ class StarcraftRCApp:
                 elif clicked_btn == "recall":
                     target_home = self.home_pos if self.home_pos is not None else (640, 360)
                     if self.last_robot_pos is not None:
+                        self._clear_ultrasonic_objects()
                         total_obs = self.latest_obstacle_mask
                         self.nav.set_goal(self.last_robot_pos, target_home, total_obs)
                     else:
@@ -466,6 +475,7 @@ class StarcraftRCApp:
             cam_y = int(y * config.WINDOW_HEIGHT / CAM_H)
             
             if self.last_robot_pos is not None:
+                self._clear_ultrasonic_objects()
                 total_obs = self.latest_obstacle_mask
                 self.nav.set_goal(self.last_robot_pos, (cam_x, cam_y), total_obs)
             else:
@@ -649,6 +659,7 @@ class StarcraftRCApp:
                 self.latest_obstacle_mask = obstacle_mask
 
                 robot_pos, robot_angle, corners, is_tracked, _ = self.tracker.detect(warped_map)
+                marker_size_px = 0.0
                 
                 if is_tracked and robot_pos is not None:
                     self.last_robot_pos = robot_pos
@@ -662,6 +673,7 @@ class StarcraftRCApp:
                         side2 = float(np.linalg.norm(pts[3] - pts[2]))
                         side3 = float(np.linalg.norm(pts[0] - pts[3]))
                         avg_side = (side0 + side1 + side2 + side3) / 4.0
+                        marker_size_px = avg_side
                         self.nav.planner.robot_radius_px = max(
                             60,
                             int(avg_side * config.ROBOT_BODY_LENGTH_SCALE / 2.0),
@@ -672,6 +684,14 @@ class StarcraftRCApp:
                         self.home_pos = robot_pos
                         print(f"[홈 등록] 초기 위치: {self.home_pos}")
 
+                if config.ENABLE_ULTRASONIC_REPLANNING == 1:
+                    self._add_ultrasonic_obstacles(
+                        obstacle_mask,
+                        detections,
+                        robot_pos,
+                        robot_angle,
+                        marker_size_px,
+                    )
                 ultrasonic_reversing = self._update_ultrasonic_emergency()
                 self.latest_detections = detections
                 self.latest_obstacle_mask = obstacle_mask
