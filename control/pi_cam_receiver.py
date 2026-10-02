@@ -32,14 +32,14 @@ class PiCamReceiver:
         self.running = True
         self.thread = threading.Thread(target=self._receive_loop, daemon=True)
         self.thread.start()
-        print(f"[라즈베리파이 캠] 수신 스레드 시작 ({self.url})")
+        print(f"[PI CAMERA] Receiver thread started ({self.url})")
 
     def stop(self):
         self.running = False
         if self.thread and self.thread.is_alive():
             self.thread.join(timeout=1.0)
         self.is_connected = False
-        print("[라즈베리파이 캠] 수신 스레드 종료")
+        print("[PI CAMERA] Receiver thread stopped")
 
     def get_latest_frame(self) -> Optional[np.ndarray]:
         with self.lock:
@@ -59,7 +59,7 @@ class PiCamReceiver:
                 req = urllib.request.Request(self.url, headers={"User-Agent": "RC-GCS-Client"})
                 stream = urllib.request.urlopen(req, timeout=2.5)
                 self.is_connected = True
-                print(f"[라즈베리파이 캠] 연결 성공: {self.url}")
+                print(f"[PI CAMERA] Connected: {self.url}")
 
                 bytes_buffer = b""
                 while self.running:

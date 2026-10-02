@@ -98,7 +98,7 @@ class UIButtonManager:
                 return f"map_cam_{self.map_cam_mode.lower()}"
             self.last_toggle_time = now
             self.map_cam_mode = "CAM" if self.map_cam_mode == "MAP" else "MAP"
-            print(f"[UI] 모드 전환: {self.map_cam_mode}")
+            print(f"[UI] Mode switched: {self.map_cam_mode}")
             return f"map_cam_{self.map_cam_mode.lower()}"
 
         # 2. 액션 버튼 클릭 확인
@@ -113,7 +113,7 @@ class UIButtonManager:
 
             if is_hit:
                 self.pressed_button = name
-                print(f"[UI] {name.upper()} 버튼 클릭")
+                print(f"[UI] {name.upper()} button clicked")
                 return name
 
         return None

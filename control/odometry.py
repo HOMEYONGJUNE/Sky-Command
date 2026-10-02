@@ -43,7 +43,7 @@ class OdometryEstimator:
         if self.home_pos is None:
             self.home_pos = (int(self.est_x), int(self.est_y))
             self.home_angle_deg = float(robot_angle_deg)
-            print(f"[HOME REGISTERED] 기준 홈 위치 등록 완료: {self.home_pos} ({self.home_angle_deg:.1f}°)")
+            print(f"[HOME REGISTERED] Home position registered: {self.home_pos} ({self.home_angle_deg:.1f} degrees)")
 
         self.is_initialized = True
 
@@ -90,4 +90,4 @@ class OdometryEstimator:
         """수동으로 홈 위치 설정"""
         self.home_pos = pos
         self.home_angle_deg = angle_deg
-        print(f"[HOME MANUAL] 홈 위치 수동 재설정: {self.home_pos}")
+        print(f"[HOME MANUAL] Home position reset: {self.home_pos}")

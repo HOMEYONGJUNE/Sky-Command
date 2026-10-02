@@ -68,9 +68,9 @@ def load_hsv_settings(filepath: str, default_blue_hsv, default_green_hsv, defaul
                 if "blue_radius_y" not in settings or settings["blue_radius_y"] == default_blue_radius_y:
                     settings["blue_radius_y"] = max(10, int(round(legacy_radius * 1.3)))
 
-            print(f"[설정 로드] {os.path.basename(filepath)}에서 HSV 및 좌우/상하 반경 설정을 불러왔습니다.")
+            print(f"[CONFIG] Loaded HSV and radius settings from {os.path.basename(filepath)}.")
         except Exception as e:
-            print(f"[설정 로드 오류]: {e}")
+            print(f"[CONFIG ERROR] Failed to load settings: {e}")
     else:
         save_hsv_settings(
             filepath,
@@ -102,7 +102,7 @@ def save_hsv_settings(filepath: str, blue_hsv, green_hsv, blue_radius_x, blue_ra
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(content)
     except Exception as e:
-        print(f"[설정 저장 오류]: {e}")
+        print(f"[CONFIG ERROR] Failed to save settings: {e}")
 
 
 class StarcraftRCApp:
@@ -111,7 +111,7 @@ class StarcraftRCApp:
         self.logger = TerminalLogger(max_lines=config.MAX_CONSOLE_LINES)
         self.logger.start_capture()
 
-        print(f"[프로그램 시작] {config.WINDOW_TITLE}")
+        print(f"[STARTUP] {config.WINDOW_TITLE}")
 
         # 제어 및 비전 모듈 초기화
         self.motor = MotorClient(ip=config.RASPBERRY_PI_IP, port=config.UDP_PORT)
@@ -137,12 +137,7 @@ class StarcraftRCApp:
             image_size=320,
             box_scale=config.OBSTACLE_BOX_SCALE,
         )
-        print(f"[장애물 모델] YOLO 모델 로드 완료: {OBSTACLE_MODEL_PATH}")
-        print(
-            f"[초음파 경로 재탐색] "
-            f"{'활성화' if config.ENABLE_ULTRASONIC_REPLANNING == 1 else '비활성화'}"
-        )
-
+        print(f"[MODEL] YOLO model loaded: {OBSTACLE_MODEL_PATH}")
         self.nav = StarcraftNavigator(
             kp_angle=config.KP_ANGLE,
             kd_angle=config.KD_ANGLE,
@@ -180,10 +175,10 @@ class StarcraftRCApp:
         self.has_camera = self.cap.isOpened()
 
         if self.has_camera:
-            print(f"[카메라] {config.CAMERA_INDEX}번 연결 완료")
+            print(f"[CAMERA] Device {config.CAMERA_INDEX} connected")
             self._init_camera_focus()
         else:
-            print("[카메라] 가상 모드로 동작")
+            print("[CAMERA] Running in virtual mode")
 
         # 상태 변수
         self.is_running = True
@@ -194,7 +189,6 @@ class StarcraftRCApp:
         
         self.latest_obstacle_mask = None
         self.latest_detections = []
-        self.last_ultrasonic_log_time = 0.0
         self.frame_count = 0
         self.last_detection_mask = None
         self.last_detections = []
@@ -380,11 +374,6 @@ class StarcraftRCApp:
             self.ultrasonic_trigger_latched = True
             self.ultrasonic_reverse_until = now + config.ULTRASONIC_REVERSE_SEC
             self.ultrasonic_replan_pending = True
-            print(
-                f"[초음파 비상 회피] {closest_cm:.1f}cm 감지 -> "
-                f"{config.ULTRASONIC_REVERSE_SEC:.1f}초 후진 후 경로 재탐색",
-                flush=True,
-            )
             return True
 
         return False
@@ -392,19 +381,19 @@ class StarcraftRCApp:
     def _init_camera_focus(self):
         # 포커스를 흔들어 오토포커스 재기동 ('F' 키 기능)
         if not self.has_camera:
-            print("[카메라] 연결된 카메라가 없습니다.")
+            print("[CAMERA] No camera connected.")
             return
         try:
-            print("[카메라] 'F' 키 입력: 초점(Autofocus) 자동 맞춤 실행 중...")
+            print("[CAMERA] Pressing 'F': running autofocus...")
             self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
             self.cap.set(cv2.CAP_PROP_FOCUS, 0)
             time.sleep(0.08)
             self.cap.set(cv2.CAP_PROP_FOCUS, 100)
             time.sleep(0.08)
             self.cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
-            print("[카메라] 초점 맞춤 완료")
+            print("[CAMERA] Autofocus complete")
         except Exception as e:
-            print(f"[카메라 포커스 오류]: {e}")
+            print(f"[CAMERA FOCUS ERROR]: {e}")
 
     def _on_key_press(self, key):
         """pynput: OS 레벨 키 누름 이벤트 - 눌린 키를 집합에 추가"""
@@ -431,14 +420,14 @@ class StarcraftRCApp:
         if event == cv2.EVENT_LBUTTONDOWN:
             # 1. ArUco 5초 미감지 수동 전환 창의 버튼 클릭 체크 (Sudong_button.png 투명 제외 영역)
             if getattr(self, "show_lost_warning", False) and self.renderer.is_sudong_button_clicked(x, y):
-                print("[UI] Sudong_button 클릭 감지 -> 수동 조작 모드로 전환합니다.")
+                print("[UI] Manual-control button clicked; switching to manual mode.")
                 self.show_lost_warning = False
                 self._enter_manual_mode()
                 return
 
             # 2. 좌측 상단 주행 모드 전환 버튼 클릭 체크 (driving_mode_switch_button.png 투명 제외 영역)
             if self.renderer.is_driving_mode_switch_clicked(x, y):
-                print("[UI] driving_mode_switch_button 클릭 감지 -> 주행 모드 전환")
+                print("[UI] Driving-mode button clicked; switching driving mode.")
                 self._toggle_manual_mode()
                 return
 
@@ -449,7 +438,7 @@ class StarcraftRCApp:
                 elif clicked_btn == "stop":
                     self.motor.stop()
                     self.nav.reset()
-                    print("[정지] STOP 버튼")
+                    print("[STOP] STOP button pressed")
                 elif clicked_btn == "recall":
                     target_home = self.home_pos if self.home_pos is not None else (640, 360)
                     if self.last_robot_pos is not None:
@@ -457,7 +446,7 @@ class StarcraftRCApp:
                         total_obs = self.latest_obstacle_mask
                         self.nav.set_goal(self.last_robot_pos, target_home, total_obs)
                     else:
-                        print("[오류] 마커 미인식")
+                        print("[ERROR] Marker not detected")
                 return
 
         # 좌클릭 뗌
@@ -479,7 +468,7 @@ class StarcraftRCApp:
                 total_obs = self.latest_obstacle_mask
                 self.nav.set_goal(self.last_robot_pos, (cam_x, cam_y), total_obs)
             else:
-                print(f"[명령 대기] 마커 미인식 (목표: {cam_x}, {cam_y})")
+                print(f"[WAITING] Marker not detected (target: {cam_x}, {cam_y})")
 
     def _setup_hsv_controls(self):
         def nothing(val):
@@ -555,7 +544,7 @@ class StarcraftRCApp:
             self.is_fading = True
             self.fade_start_time = time.time()
             self.fade_target = True  # 목표: 수동 화면
-            print("[수동 모드] 수동 조작 모드로 전환 중... (P: 자동 모드 복귀 | W/A/S/D: 조작)")
+            print("[MODE] Switching to manual mode... (P: automatic mode | W/A/S/D: controls)")
 
     def _exit_manual_mode(self):
         """자동 조작 모드로 복귀 (페이드 시작)."""
@@ -567,7 +556,7 @@ class StarcraftRCApp:
             self.is_fading = True
             self.fade_start_time = time.time()
             self.fade_target = False  # 목표: 자동(탑뷰) 화면
-            print("[자동 모드] 자동 조작 모드로 복귀 중...")
+            print("[MODE] Returning to automatic mode...")
 
     def _toggle_manual_mode(self):
         """P키: 수동/자동 토글"""
@@ -682,7 +671,7 @@ class StarcraftRCApp:
 
                     if self.home_pos is None:
                         self.home_pos = robot_pos
-                        print(f"[홈 등록] 초기 위치: {self.home_pos}")
+                        print(f"[HOME] Initial position registered: {self.home_pos}")
 
                 if config.ENABLE_ULTRASONIC_REPLANNING == 1:
                     self._add_ultrasonic_obstacles(
@@ -710,7 +699,6 @@ class StarcraftRCApp:
                     and robot_pos is not None
                     and self.nav.final_goal is not None
                 ):
-                    print("[A*] 초음파 장애물 반영 -> 경로 재탐색")
                     self.nav.set_goal(
                         robot_pos,
                         self.nav.final_goal,
@@ -725,7 +713,7 @@ class StarcraftRCApp:
                     and self.nav.final_goal is not None
                     and self.nav.is_current_path_blocked(self.latest_obstacle_mask, robot_pos)
                 ):
-                    print("[A*] 장애물 객체가 현재 경로를 차단함 -> 경로 재탐색")
+                    print("[A*] Obstacle blocks the current path; replanning.")
                     self.nav.set_goal(
                         robot_pos,
                         self.nav.final_goal,
@@ -836,7 +824,7 @@ class StarcraftRCApp:
             self.cap.release()
         cv2.destroyAllWindows()
         self.logger.restore()
-        print("[종료] 프로그램 종료 (HSV 설정 저장 완료)")
+        print("[SHUTDOWN] Program stopped (HSV settings saved).")
 
 
 if __name__ == "__main__":
@@ -844,6 +832,6 @@ if __name__ == "__main__":
         app = StarcraftRCApp()
         app.run()
     except KeyboardInterrupt:
-        print("\n[종료] 키보드 인터럽트")
+        print("\n[SHUTDOWN] Keyboard interrupt.")
     except Exception as e:
-        print(f"\n[오류]: {e}")
+        print(f"\n[ERROR]: {e}")

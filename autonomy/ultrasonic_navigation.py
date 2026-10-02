@@ -257,11 +257,11 @@ class UltrasonicAStarController:
 
         # 양쪽이 동시에 막히면 전진 경로가 없으므로 정지하고 다음 샘플에서 재탐색한다.
         if left_blocked and right_blocked:
-            print("[PATH] 좌우 모두 20 cm 이내 -> 정지 (A* 재탐색 대기)")
+            print("[PATH] Obstacles within 20 cm on both sides; stopping and waiting for A* replanning")
             return 0.0, 0.0, path
 
         if len(path) < 2:
-            print("[PATH] 유효한 A* 우회 경로 없음 -> 정지")
+            print("[PATH] No valid A* detour found; stopping")
             return 0.0, 0.0, path
 
         next_x, _ = path[1]
@@ -269,10 +269,10 @@ class UltrasonicAStarController:
         speed = 55.0 if mask[1, self.grid.width // 2] == 0 else 35.0
         if left_blocked and not right_blocked:
             steer = min(steer, -25.0)
-            print("[PATH] 왼쪽 장애물 회피 -> 오른쪽으로 조향")
+            print("[PATH] Avoiding left obstacle; steering right")
         elif right_blocked and not left_blocked:
             steer = max(steer, 25.0)
-            print("[PATH] 오른쪽 장애물 회피 -> 왼쪽으로 조향")
+            print("[PATH] Avoiding right obstacle; steering left")
         return speed - steer, speed + steer, path
 
     def run(self, period_s: float = 0.1) -> None:
@@ -282,7 +282,7 @@ class UltrasonicAStarController:
                 print(f"[AUTO] L={left:+.0f} R={right:+.0f} path={len(path)}")
                 time.sleep(period_s)
         except KeyboardInterrupt:
-            print("\n[종료] 초음파 자율주행을 종료합니다.")
+            print("\n[SHUTDOWN] Ultrasonic autonomy stopped.")
         finally:
             self.sensors.close()
 

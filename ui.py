@@ -34,12 +34,12 @@ try:
     orig_ui = cv2.imdecode(img_array, cv2.IMREAD_UNCHANGED)
 except Exception as e:
     sys.stdout = sys.__stdout__
-    print(f"[에러] UI 이미지를 읽는 도중 오류 발생: {e}")
+    print(f"[UI ERROR] Failed to read UI image: {e}")
     sys.exit()
 
 if orig_ui is None:
     sys.stdout = sys.__stdout__
-    print("[에러] UI 이미지를 로드하지 못했습니다. 경로를 확인하세요.")
+    print("[UI ERROR] Failed to load UI image; check the path.")
     sys.exit()
 
 ui_img = cv2.resize(orig_ui, (WINDOW_W, WINDOW_H))

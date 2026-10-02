@@ -32,7 +32,7 @@ class MotorClient:
             self.is_connected = True
         except Exception as e:
             self.is_connected = False
-            print(f"[UDP 통신 오류]: {e}")
+            print(f"[UDP ERROR]: {e}")
 
     def start_telemetry_listener(self):
         if self.telemetry_running:
@@ -40,7 +40,7 @@ class MotorClient:
         try:
             self.telemetry_sock.bind(("0.0.0.0", self.telemetry_port))
         except OSError as e:
-            print(f"[초음파 로그 수신 오류] UDP {self.telemetry_port} 포트를 열 수 없습니다: {e}")
+            print(f"[TELEMETRY ERROR] Cannot bind UDP port {self.telemetry_port}: {e}")
             return
         self.telemetry_running = True
         self.telemetry_thread = threading.Thread(
@@ -49,7 +49,7 @@ class MotorClient:
             daemon=True,
         )
         self.telemetry_thread.start()
-        print(f"[초음파 로그] 라즈베리파이 센서 수신 대기 (UDP {self.telemetry_port})")
+        print(f"[TELEMETRY] Waiting for Raspberry Pi sensor data on UDP {self.telemetry_port}")
 
     def _telemetry_loop(self):
         while self.telemetry_running:
@@ -70,7 +70,7 @@ class MotorClient:
                 continue
             except (OSError, ValueError, KeyError) as e:
                 if self.telemetry_running:
-                    print(f"[초음파 로그 수신 오류] {e}")
+                    print(f"[TELEMETRY ERROR] Receive failed: {e}")
 
     def get_ultrasonic_reading(self):
         with self.ultrasonic_state_lock:

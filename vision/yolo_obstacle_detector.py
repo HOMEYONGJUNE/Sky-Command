@@ -45,11 +45,11 @@ class YOLOObstacleDetector:
         try:
             import torch
             if torch.backends.mps.is_available():
-                print("[YOLO] Apple Silicon MPS 가속 사용")
+                print("[YOLO] Using Apple Silicon MPS acceleration")
                 return "mps"
         except (ImportError, AttributeError):
             pass
-        print("[YOLO] MPS 사용 불가 -> CPU 추론")
+        print("[YOLO] MPS unavailable; using CPU inference")
         return "cpu"
 
     def detect(self, frame: np.ndarray) -> Tuple[List[Detection], np.ndarray]:

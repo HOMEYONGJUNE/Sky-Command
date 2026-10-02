@@ -10,14 +10,14 @@ try:
     import cv2
     CV2_AVAILABLE = True
 except ImportError:
-    print("[경고] OpenCV(cv2) 없음 - 카메라 스트리밍 비활성화")
+    print("[WARNING] OpenCV(cv2) unavailable - camera streaming disabled")
     CV2_AVAILABLE = False
 
 try:
     from gpiozero import LED, PWMLED
     GPIO_AVAILABLE = True
 except ImportError:
-    print("[경고] gpiozero 없음 (시뮬레이션 모드)")
+    print("[WARNING] gpiozero unavailable (simulation mode)")
     GPIO_AVAILABLE = False
 
 try:
@@ -112,7 +112,7 @@ class PiCameraStreamer:
         # 1. 라즈베리 파이 5 전용 Picamera2 시도 (CSI 포트 ov5647 등 공식 카메라)
         if PICAMERA2_AVAILABLE:
             try:
-                print("[카메라] Picamera2 초기화 시도...")
+                print("[CAMERA] Initializing Picamera2...")
                 p2 = Picamera2()
                 cfg = p2.create_video_configuration(main={"size": (self.width, self.height), "format": "BGR888"})
                 p2.configure(cfg)
@@ -120,13 +120,13 @@ class PiCameraStreamer:
                 time.sleep(0.5)
                 test_arr = p2.capture_array()
                 if test_arr is not None and test_arr.size > 0:
-                    print(f"[카메라] Picamera2 연결 성공! 해상도: {self.width}x{self.height}")
+                    print(f"[CAMERA] Picamera2 connected: {self.width}x{self.height}")
                     self.picam2 = p2
                     return "picam2"
                 p2.stop()
                 p2.close()
             except Exception as e:
-                print(f"[카메라] Picamera2 실패 ({e}) -> OpenCV VideoCapture 시도")
+                print(f"[CAMERA] Picamera2 failed ({e}); trying OpenCV VideoCapture")
 
         # 2. OpenCV VideoCapture 시도 (USB 카메라 또는 V4L2)
         if CV2_AVAILABLE:
@@ -141,14 +141,14 @@ class PiCameraStreamer:
                         cap.set(cv2.CAP_PROP_FPS, 30)
                         ret, test_f = cap.read()
                         if ret and test_f is not None:
-                            print(f"[카메라] OpenCV {idx}번 포트 연결 성공! 해상도: {self.width}x{self.height}")
+                            print(f"[CAMERA] OpenCV device {idx} connected: {self.width}x{self.height}")
                             self.cap = cap
                             return "opencv"
                         cap.release()
                 except Exception:
                     pass
 
-        print("[카메라 경고] 사용 가능한 카메라를 찾지 못했습니다. (재시도 대기)")
+        print("[CAMERA WARNING] No usable camera found; retrying")
         return None
 
     def _capture_loop(self):
@@ -171,7 +171,7 @@ class PiCameraStreamer:
                         time.sleep(0.02)
                         continue
                 except Exception as e:
-                    print(f"[카메라 Picamera2 오류]: {e}")
+                    print(f"[CAMERA Picamera2 ERROR]: {e}")
                     cam_type = None
 
             elif cam_type == "opencv" and self.cap is not None:
@@ -191,7 +191,7 @@ class PiCameraStreamer:
                         time.sleep(0.02)
                         continue
                 except Exception as e:
-                    print(f"[카메라 OpenCV 오류]: {e}")
+                    print(f"[CAMERA OpenCV ERROR]: {e}")
                     cam_type = None
 
             # 카메라가 끊겼거나 없는 경우 2초마다 재시도
@@ -216,9 +216,9 @@ class PiCameraStreamer:
             self.server = ThreadedHTTPServer(("0.0.0.0", self.http_port), StreamingHandler)
             self.server_thread = threading.Thread(target=self.server.serve_forever, daemon=True)
             self.server_thread.start()
-            print(f"[카메라 스트리머 시작] http://0.0.0.0:{self.http_port}/stream.mjpg")
+            print(f"[CAMERA] Streamer started: http://0.0.0.0:{self.http_port}/stream.mjpg")
         except Exception as e:
-            print(f"[카메라 스트리머 서버 오류]: {e}")
+            print(f"[CAMERA SERVER ERROR]: {e}")
 
     def stop(self):
         self.running = False
@@ -236,7 +236,7 @@ class PiCameraStreamer:
                 pass
         if self.cap and self.cap.isOpened():
             self.cap.release()
-        print("[카메라 스트리머 종료 완료]")
+        print("[CAMERA] Streamer stopped")
 
 
 # GPIO 핀 설정
@@ -277,7 +277,6 @@ MOTOR_GAIN = 0.864
 # 좌우 모터가 반대 방향으로 도는 제자리 회전 출력 게인
 # 기존 0.80에서 15% 상향
 ROTATION_MOTOR_GAIN = 0.92
-ULTRASONIC_LOG_INTERVAL = 1.0
 ULTRASONIC_POLL_INTERVAL = 0.05
 ULTRASONIC_STOP_DISTANCE_M = 0.07
 ultrasonic_sensors = []
@@ -289,23 +288,12 @@ telemetry_sock = None
 
 
 def _ultrasonic_log_loop():
-    """센서를 빠르게 감시하고, 로그는 1초마다 관제 PC로 보낸다."""
-    last_log_time = 0.0
+    """센서 데이터를 관제 PC로 전송한다."""
     while ultrasonic_running:
         try:
             left = ultrasonic_sensors[0].distance * ultrasonic_sensors[0].max_distance
             right = ultrasonic_sensors[1].distance * ultrasonic_sensors[1].max_distance
             blocked = min(left, right) <= ULTRASONIC_STOP_DISTANCE_M
-
-            now = time.monotonic()
-            if now - last_log_time >= ULTRASONIC_LOG_INTERVAL:
-                print(
-                    f"[ULTRASONIC] left={left * 100:5.1f}cm "
-                    f"right={right * 100:5.1f}cm "
-                    f"stop={'YES' if blocked else 'NO'}",
-                    flush=True,
-                )
-                last_log_time = now
 
             with last_client_lock:
                 client_addr = last_client_addr
@@ -318,17 +306,16 @@ def _ultrasonic_log_loop():
                 if telemetry_sock is not None:
                     try:
                         telemetry_sock.sendto(telemetry, (client_addr[0], TELEMETRY_PORT))
-                    except OSError as e:
-                        print(f"[초음파 전송 오류] {e}", flush=True)
-        except Exception as e:
-            print(f"[초음파 센서 오류] {e}", flush=True)
+                    except OSError:
+                        pass
+        except Exception:
+            pass
         time.sleep(ULTRASONIC_POLL_INTERVAL)
 
 
 def start_ultrasonic_monitor():
     global ultrasonic_thread, ultrasonic_running
     if not ULTRASONIC_AVAILABLE:
-        print("[초음파 경고] gpiozero DistanceSensor를 사용할 수 없습니다.", flush=True)
         return
     try:
         ultrasonic_sensors.extend([
@@ -342,9 +329,7 @@ def start_ultrasonic_monitor():
             daemon=True,
         )
         ultrasonic_thread.start()
-        print("[초음파] 좌측 GPIO 4/17, 우측 GPIO 14/15 모니터 시작", flush=True)
-    except Exception as e:
-        print(f"[초음파 초기화 오류] {e}", flush=True)
+    except Exception:
         ultrasonic_sensors.clear()
 
 
@@ -420,7 +405,7 @@ def main():
     args = parser.parse_args()
 
     # 1. 라즈베리 파이 카메라 스트리머 시작 (기본: 640x480 @ 80% 화질)
-    print(f"[카메라 설정] 해상도: {args.width}x{args.height}, 화질: {args.quality}%, 포트: {args.cam_port}")
+    print(f"[CAMERA] Settings: {args.width}x{args.height}, quality: {args.quality}%, port: {args.cam_port}")
     camera_streamer = PiCameraStreamer(
         camera_index=args.cam_index,
         http_port=args.cam_port,
@@ -437,7 +422,7 @@ def main():
     sock.bind((UDP_IP, UDP_PORT))
     sock.settimeout(WATCHDOG_TIMEOUT)
 
-    print(f"[모터 서버 시작] 포트: {UDP_PORT}")
+    print(f"[MOTOR] Server started on port {UDP_PORT}")
     stop_all()
     last_print_time = 0
 
@@ -463,17 +448,17 @@ def main():
                 now = time.time()
                 if now - last_print_time > 0.5:
                     last_print_time = now
-                    print(f"\r[수신중] Left: {v_l:+6.1f} | Right: {v_r:+6.1f} | From: {addr[0]}", end="", flush=True)
+                    print(f"\r[RECEIVING] Left: {v_l:+6.1f} | Right: {v_r:+6.1f} | From: {addr[0]}", end="", flush=True)
 
             except socket.timeout:
                 stop_all()
 
             except Exception as e:
-                print(f"\n[오류 발생]: {e}")
+                print(f"\n[ERROR]: {e}")
                 stop_all()
 
     except KeyboardInterrupt:
-        print("\n[종료] 서버를 종료합니다.")
+        print("\n[SHUTDOWN] Stopping server.")
     finally:
         stop_all()
         stop_ultrasonic_monitor()
@@ -485,7 +470,7 @@ def main():
                 device.close()
             except Exception:
                 pass
-        print("[완료] 모터 정지 및 GPIO/카메라 자원 해제 완료.")
+        print("[DONE] Motors stopped; GPIO and camera resources released.")
 
 
 if __name__ == "__main__":

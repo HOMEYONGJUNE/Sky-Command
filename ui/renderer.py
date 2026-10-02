@@ -229,7 +229,7 @@ class UIRenderer:
                 bbox = None
             return bgr, alpha, bbox
         except Exception as e:
-            print(f"[UI 로드 오류] {path}: {e}")
+            print(f"[UI LOAD ERROR] {path}: {e}")
             return None, None, None
 
     def _blend_layer(

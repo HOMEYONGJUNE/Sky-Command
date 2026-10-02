@@ -110,7 +110,7 @@ class StarcraftNavigator:
             self.waypoints = [goal_pos]
             self.current_wp_idx = 0
             self.state = NavState.LOST_ROBOT
-            print(f"[NAV] 목표 설정: {goal_pos} (로봇 미감지)")
+            print(f"[NAV] Goal set: {goal_pos} (robot not detected)")
             return
 
         # A* 경로 계산
@@ -119,7 +119,7 @@ class StarcraftNavigator:
             try:
                 path = self.planner.plan(robot_pos, goal_pos, obstacle_mask)
             except Exception as e:
-                print(f"[A* 오류]: {e}")
+                print(f"[A* ERROR]: {e}")
 
         # 경로 없으면 직선 경로로 대체
         if not path:
@@ -135,7 +135,7 @@ class StarcraftNavigator:
             self.current_wp_idx = 0
 
         self.state = NavState.MOVING
-        print(f"[NAV] 목표 이동: {goal_pos} (웨이포인트 {len(self.waypoints)}개)")
+        print(f"[NAV] Moving to goal: {goal_pos} ({len(self.waypoints)} waypoints)")
 
     def _densify_path(self, path: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
         """A*의 긴 선분을 촘촘한 체크포인트로 나눠 코너 진입을 정밀하게 한다."""
@@ -163,7 +163,7 @@ class StarcraftNavigator:
         obstacle_mask: Optional[np.ndarray] = None,
         is_blind: bool = False
     ):
-        print(f"[NAV] 홈 복귀: {home_pos}")
+        print(f"[NAV] Returning home: {home_pos}")
         self.set_goal(current_pos, home_pos, obstacle_mask)
 
     def update_control(
@@ -192,7 +192,7 @@ class StarcraftNavigator:
             self.state = NavState.ARRIVED
             self.final_goal = None
             self.waypoints.clear()
-            print(f"[NAV] 목적지 도착 완료 (오차: {dist_to_final:.1f}px)")
+            print(f"[NAV] Destination reached (error: {dist_to_final:.1f}px)")
             return 0.0, 0.0, NavState.ARRIVED
 
         # 2. 현재 타겟 웨이포인트 선택
