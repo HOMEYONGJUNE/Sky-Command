@@ -19,8 +19,8 @@ UDP_PORT = 8080
 UDP_TIMEOUT_SEC = 0.2
 RASPBERRY_PI_CAM_PORT = 8081  # 라즈베리파이 온보드 카메라 HTTP MJPEG 스트리밍 포트
 RASPBERRY_PI_CAM_INDEX = 1    # 라즈베리파이 카메라 연결 포트/인덱스 (기본: 1)
-PI_CAM_WIDTH = 640            # 온보드 카메라 기본 가로 해상도 (고화질: 1280)
-PI_CAM_HEIGHT = 480           # 온보드 카메라 기본 세로 해상도 (고화질: 720)
+PI_CAM_WIDTH = 1280           # 온보드 카메라 기본 가로 해상도
+PI_CAM_HEIGHT = 720           # 온보드 카메라 기본 세로 해상도
 
 # 관제 PC 상단 카메라 및 맵 설정
 CAMERA_INDEX = 0

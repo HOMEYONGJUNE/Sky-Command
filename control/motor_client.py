@@ -16,6 +16,8 @@ class MotorClient:
         self.telemetry_running = False
         self.telemetry_thread = None
         self.ultrasonic_reading = {"left_cm": 50.0, "right_cm": 50.0}
+        self.onboard_detections = []
+        self.last_detection_labels = ()
         self.ultrasonic_state_lock = threading.Lock()
         self.last_sent: Tuple[int, int] = (0, 0)
         self.is_connected = True
@@ -33,6 +35,16 @@ class MotorClient:
         except Exception as e:
             self.is_connected = False
             print(f"[UDP ERROR]: {e}")
+
+    def activate_smoke(self):
+        try:
+            self.sock.sendto(
+                json.dumps({"command": "smoke"}).encode("utf-8"),
+                (self.ip, self.port),
+            )
+        except OSError as e:
+            self.is_connected = False
+            print(f"[UDP ERROR] Smoke command failed: {e}")
 
     def start_telemetry_listener(self):
         if self.telemetry_running:
@@ -61,11 +73,23 @@ class MotorClient:
                         "left_cm": float(payload["left_cm"]),
                         "right_cm": float(payload["right_cm"]),
                     }
-                print(
-                    f"[ULTRASONIC/PI] left={float(payload['left_cm']):5.1f}cm "
-                    f"right={float(payload['right_cm']):5.1f}cm",
-                    flush=True,
-                )
+                    detections = []
+                    for item in payload.get("onboard_detections", []):
+                        label = str(item.get("label", "")).strip().lower()
+                        if label in {"claymore", "ally"}:
+                            detections.append({
+                                **item,
+                                "label": label,
+                            })
+                    detection_labels = tuple(sorted({item["label"] for item in detections}))
+                    if detection_labels != self.last_detection_labels:
+                        if detection_labels:
+                            print(
+                                "[TELEMETRY] Onboard detection received: "
+                                + ", ".join(detection_labels)
+                            )
+                        self.last_detection_labels = detection_labels
+                    self.onboard_detections = detections
             except socket.timeout:
                 continue
             except (OSError, ValueError, KeyError) as e:
@@ -75,6 +99,10 @@ class MotorClient:
     def get_ultrasonic_reading(self):
         with self.ultrasonic_state_lock:
             return dict(self.ultrasonic_reading)
+
+    def get_onboard_detections(self):
+        with self.ultrasonic_state_lock:
+            return list(self.onboard_detections)
 
     def stop_telemetry_listener(self):
         self.telemetry_running = False

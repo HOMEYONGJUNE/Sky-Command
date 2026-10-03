@@ -277,6 +277,8 @@ class UIRenderer:
         detections: Optional[list] = None,
         ping_pos: Optional[Tuple[int, int]] = None,
         ping_start_time: float = 0.0,
+        onboard_alerts: Optional[List[str]] = None,
+        onboard_alert_start_time: float = 0.0,
         mouse_pos: Tuple[int, int] = (0, 0),
         status_text: str = "IDLE",
         speed_info: Tuple[int, int] = (0, 0),
@@ -492,6 +494,47 @@ class UIRenderer:
                 mrp = mm(robot_pos)
                 cv2.circle(minimap, mrp, 4, (0, 230, 25), -1, cv2.LINE_AA)
                 cv2.circle(minimap, mrp, 6, (0, 180, 10), 1, cv2.LINE_AA)
+
+                alerts = set(onboard_alerts or [])
+                if alerts and onboard_alert_start_time > 0:
+                    elapsed = time.time() - onboard_alert_start_time
+                    if elapsed >= 0:
+                        pulse = elapsed % 1.2
+                        progress = pulse / 1.2
+                        radius = int(7 + progress * 22)
+                        alpha = 1.0 - progress
+                        alert_overlay = minimap.copy()
+                        if "claymore" in alerts:
+                            color = (0, 0, 255)
+                            cv2.circle(alert_overlay, mrp, radius, color, 2, cv2.LINE_AA)
+                            cv2.drawMarker(
+                                alert_overlay,
+                                mrp,
+                                color,
+                                cv2.MARKER_TILTED_CROSS,
+                                12,
+                                2,
+                                cv2.LINE_AA,
+                            )
+                        if "ally" in alerts:
+                            color = (0, 255, 0)
+                            cv2.circle(alert_overlay, mrp, max(5, radius - 5), color, 2, cv2.LINE_AA)
+                            cv2.drawMarker(
+                                alert_overlay,
+                                mrp,
+                                color,
+                                cv2.MARKER_DIAMOND,
+                                12,
+                                2,
+                                cv2.LINE_AA,
+                            )
+                        minimap = cv2.addWeighted(
+                            minimap,
+                            1.0 - alpha * 0.85,
+                            alert_overlay,
+                            alpha * 0.85,
+                            0,
+                        )
 
             canvas[MM_Y1:MM_Y2, MM_X1:MM_X2] = minimap
 

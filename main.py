@@ -1,6 +1,8 @@
 import math
 import sys
 import os
+import shutil
+import subprocess
 import time
 import threading
 import cv2
@@ -28,6 +30,61 @@ MANUAL_PWM = 100 # 수동 모드 모터 속도 (0~255)
 OBSTACLE_MODEL_PATH = os.path.join(CURRENT_DIR, "best.pt")
 ULTRASONIC_MAX_RANGE_CM = 50.0
 ULTRASONIC_PIXELS_PER_METER = 500.0
+
+
+class AudioPlayer:
+    def __init__(self, ui_dir: str):
+        self.paths = {
+            "ally": os.path.join(ui_dir, "ally_alert.wav"),
+            "claymore": os.path.join(ui_dir, "enemy_alert.wav"),
+            "click": os.path.join(ui_dir, "click.wav"),
+        }
+        self.player = self._find_player()
+        self.warned_missing_player = False
+        self.process = None
+        self.lock = threading.Lock()
+        if self.player is None:
+            print("[AUDIO ERROR] No WAV player found (afplay/ffplay/mpg123/mpg321).")
+        for sound_name in ("ally", "claymore", "click"):
+            if not os.path.isfile(self.paths[sound_name]):
+                print(f"[AUDIO ERROR] Missing sound file: {self.paths[sound_name]}")
+
+    @staticmethod
+    def _find_player():
+        if sys.platform == "darwin" and shutil.which("afplay"):
+            return ["afplay"]
+        for executable in ("ffplay", "mpg123", "mpg321"):
+            if shutil.which(executable):
+                return [executable, "-nodisp", "-autoexit"] if executable == "ffplay" else [executable]
+        return None
+
+    def play(self, sound_name: str):
+        if self.player is None:
+            return
+        path = self.paths.get(sound_name)
+        if path is None or not os.path.isfile(path):
+            return
+        try:
+            with self.lock:
+                if self.process is not None and self.process.poll() is None:
+                    self.process.terminate()
+                self.process = subprocess.Popen(
+                    [*self.player, path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                print(f"[AUDIO] Playing {sound_name} alert.")
+        except OSError:
+            if not self.warned_missing_player:
+                print("[AUDIO ERROR] Unable to start the audio player.")
+                self.warned_missing_player = True
+
+    def close(self):
+        with self.lock:
+            if self.process is not None and self.process.poll() is None:
+                self.process.terminate()
+            self.process = None
 
 
 
@@ -110,6 +167,7 @@ class StarcraftRCApp:
         # 콘솔 로거 설정
         self.logger = TerminalLogger(max_lines=config.MAX_CONSOLE_LINES)
         self.logger.start_capture()
+        self.audio = AudioPlayer(os.path.join(CURRENT_DIR, "ui"))
 
         print(f"[STARTUP] {config.WINDOW_TITLE}")
 
@@ -189,6 +247,9 @@ class StarcraftRCApp:
         
         self.latest_obstacle_mask = None
         self.latest_detections = []
+        self.onboard_alerts = set()
+        self.onboard_alert_start_time = 0.0
+        self.last_onboard_sound_time = {}
         self.frame_count = 0
         self.last_detection_mask = None
         self.last_detections = []
@@ -400,6 +461,12 @@ class StarcraftRCApp:
         try:
             ch = key.char.lower() if hasattr(key, 'char') and key.char else None
             if ch:
+                if ch == "h" and ch not in self._pressed_keys:
+                    if self.last_robot_pos is not None:
+                        self.home_pos = tuple(self.last_robot_pos)
+                        print(f"[HOME] Return position set to: {self.home_pos}")
+                    else:
+                        print("[HOME ERROR] Marker not detected; return position was not changed.")
                 self._pressed_keys.add(ch)
         except Exception:
             pass
@@ -415,6 +482,9 @@ class StarcraftRCApp:
 
     def _on_mouse_event(self, event, x, y, flags, param):
         self.mouse_x, self.mouse_y = x, y
+
+        if event == cv2.EVENT_LBUTTONDOWN:
+            self.audio.play("click")
 
         # 좌클릭 누름 (UI 버튼 및 옵션창 체크 - 단일 클릭만 처리하여 중복 토글 방지)
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -439,6 +509,9 @@ class StarcraftRCApp:
                     self.motor.stop()
                     self.nav.reset()
                     print("[STOP] STOP button pressed")
+                elif clicked_btn == "smoke":
+                    self.motor.activate_smoke()
+                    print("[SMOKE] Smoke button pressed; relay will run for 5 seconds.")
                 elif clicked_btn == "recall":
                     target_home = self.home_pos if self.home_pos is not None else (640, 360)
                     if self.last_robot_pos is not None:
@@ -682,6 +755,25 @@ class StarcraftRCApp:
                         marker_size_px,
                     )
                 ultrasonic_reversing = self._update_ultrasonic_emergency()
+                detected_alerts = {
+                    item["label"]
+                    for item in self.motor.get_onboard_detections()
+                    if item.get("label") in {"claymore", "ally"}
+                }
+                now = time.monotonic()
+                new_alerts = detected_alerts - self.onboard_alerts
+                for alert in detected_alerts:
+                    if (
+                        alert in new_alerts
+                        or now - self.last_onboard_sound_time.get(alert, 0.0) >= 3.0
+                    ):
+                        self.audio.play(alert)
+                        self.last_onboard_sound_time[alert] = now
+                if detected_alerts != self.onboard_alerts:
+                    self.onboard_alerts = detected_alerts
+                    self.onboard_alert_start_time = time.time() if detected_alerts else 0.0
+                    if not detected_alerts:
+                        self.last_onboard_sound_time.clear()
                 self.latest_detections = detections
                 self.latest_obstacle_mask = obstacle_mask
 
@@ -747,6 +839,8 @@ class StarcraftRCApp:
                     detections=detections,
                     ping_pos=self.nav.ping_pos,
                     ping_start_time=self.nav.ping_start_time,
+                    onboard_alerts=sorted(self.onboard_alerts),
+                    onboard_alert_start_time=self.onboard_alert_start_time,
                     mouse_pos=(self.mouse_x, self.mouse_y),
                     status_text=nav_state.value if robot_pos is not None else "SEARCHING",
                     speed_info=(int(v_left), int(v_right)),
@@ -822,6 +916,7 @@ class StarcraftRCApp:
             if self._camera_thread is not None:
                 self._camera_thread.join(timeout=1.0)
             self.cap.release()
+        self.audio.close()
         cv2.destroyAllWindows()
         self.logger.restore()
         print("[SHUTDOWN] Program stopped (HSV settings saved).")
